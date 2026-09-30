@@ -4,7 +4,7 @@ import { useRouter } from 'vue-router'
 import { showToast } from 'vant'
 import { afterChange, refreshRecords, runSync, setOperator, setProject, state } from '@/store'
 import { applyBenchTemplate, saveProject, seedHistoryRecords } from '@/db'
-import { BENCH_PROJECT_NAME, HISTORY_FACES } from '@/db/seed'
+import { BENCH_PROJECT_ID, BENCH_PROJECT_NAME, HISTORY_FACES } from '@/db/seed'
 import { HISTORY_ROWS } from '@/db/history'
 import { computeStats, recordsOfDate } from '@/core/compute'
 import type { Process, ProcessRecord } from '@/types'
@@ -112,7 +112,15 @@ function editRecord(id: string) {
 async function createBenchProject() {
   creating.value = true
   try {
-    const row = await saveProject({ name: BENCH_PROJECT_NAME })
+    const existing = state.projects.find((p) => p.id === BENCH_PROJECT_ID)
+    if (existing) {
+      await setProject(existing.id)
+      await afterChange('projects')
+      showToast('本标段项目已存在，已切换过去')
+      return
+    }
+    // 固定项目 id：两台手机分别点击也会合并成同一个项目，不会重复
+    const row = await saveProject({ id: BENCH_PROJECT_ID, name: BENCH_PROJECT_NAME })
     const tpl = await applyBenchTemplate(row.id)
     const n = await seedHistoryRecords(row.id)
     await setProject(row.id)

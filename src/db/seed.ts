@@ -79,6 +79,13 @@ export type FaceKey = keyof typeof HISTORY_FACES
 /** 本标段项目名称（一键建立项目时使用） */
 export const BENCH_PROJECT_NAME = '滚哈导流洞和和静抽蓄通风兼安全洞及进厂交通洞工程'
 
+/**
+ * 本标段项目的固定 id。
+ * 结构节点、工序、历史记录 id 都由项目 id 推导，用固定 id 才能保证
+ * 两台手机各自点"一键建立本标段项目"后合并成同一套数据，而不会出现两份。
+ */
+export const BENCH_PROJECT_ID = 'prj-bench-ghbql-bzfd'
+
 /** 由分项工程 key 反查它属于哪个工作面（历史记录导入用） */
 export function faceOfItem(itemKey: string): FaceKey | null {
   const entries = Object.entries(HISTORY_FACES) as Array<[FaceKey, (typeof HISTORY_FACES)[FaceKey]]>

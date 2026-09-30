@@ -1,7 +1,16 @@
 import { describe, expect, it } from 'vitest'
-import { BENCH_TEMPLATE, EXC_PROCESSES, HISTORY_FACES, SUP_PROCESSES, faceOfItem, refHoursOf } from '@/db/seed'
+import {
+  BENCH_PROJECT_ID,
+  BENCH_TEMPLATE,
+  EXC_PROCESSES,
+  HISTORY_FACES,
+  SUP_PROCESSES,
+  faceOfItem,
+  refHoursOf
+} from '@/db/seed'
 import { HISTORY_ROWS, buildHistoryRecords, historyProcessId } from '@/db/history'
 import { computeStats } from '@/core/compute'
+import { mergeSyncable } from '@/sync/merge'
 import type { Process, ProcessRecord } from '@/types'
 
 function flattenItems() {
@@ -132,6 +141,17 @@ describe('历史记录补录', () => {
     expect(withReason.length).toBeGreaterThanOrEqual(30)
     expect(rows.some((r) => (r.location ?? '').includes('+'))).toBe(true)
     expect(rows.every((r) => r.operatorName === '历史补录')).toBe(true)
+  })
+
+  it('两台手机各自补录后合并，不会出现两份记录（固定项目 id）', () => {
+    const phoneA = buildHistoryRecords(BENCH_PROJECT_ID)
+    const phoneB = buildHistoryRecords(BENCH_PROJECT_ID)
+    expect(phoneA.map((r) => r.id)).toEqual(phoneB.map((r) => r.id))
+    const merged = mergeSyncable(phoneA, phoneB)
+    expect(merged.rows).toHaveLength(HISTORY_ROWS.length)
+    // 内容完全一致，双方都不需要再推送
+    expect(merged.localDiffers).toBe(false)
+    expect(merged.remoteDiffers).toBe(false)
   })
 
   it('历史记录带不出效率（标准用时未填），但实际工时与空隙照常统计', () => {
