@@ -184,6 +184,17 @@ def norm(s):
     return s.replace("：", ":").replace("～", "~").replace("—", "-").replace("－", "-").replace("，", ",").replace("　", " ")
 
 
+_MANUAL_NORM = None
+
+
+def manual_norm():
+    """人工规则表也要按同样的规则归一化，否则带全角逗号的条目永远匹配不上。"""
+    global _MANUAL_NORM
+    if _MANUAL_NORM is None:
+        _MANUAL_NORM = {norm(k): v for k, v in MANUAL.items()}
+    return _MANUAL_NORM
+
+
 def parse_date(line):
     t = line.strip().strip(".").replace("月", ".").replace("日", "")
     m = re.match(r"^(?:(\d{4})[.\-年])?(\d{1,2})[.\-](\d{1,2})$", t)
@@ -200,7 +211,7 @@ def parse_date(line):
 def classify(text, family_hint):
     """按关键词 + 上下文判断工序 key（只返回工序，不返回等待原因）"""
     s = text
-    for frag, key in MANUAL.items():
+    for frag, key in manual_norm().items():
         if frag in s and key in PROCESS_KEYS:
             return key
 
@@ -254,7 +265,7 @@ def classify(text, family_hint):
 
 
 def classify_reason(text):
-    for frag, key in MANUAL.items():
+    for frag, key in manual_norm().items():
         if frag in text and key in REASON_KEYS:
             return key
     for key, _, pattern in REASON_DICT:

@@ -24,8 +24,12 @@ export interface HistoryRow {
 export const HISTORY_ROWS = (historyData.records ?? []) as HistoryRow[]
 export const HISTORY_GENERATED_AT = String(historyData.generatedAt ?? '')
 
-/** 历史补录数据的固定时间戳：保证每台手机生成的内容完全一致，便于合并 */
-export const HISTORY_TS = Date.parse('2026-09-30T20:00:00+08:00')
+/**
+ * 历史补录数据的固定时间戳：保证每台手机生成的内容完全一致，便于合并。
+ * 2026-10-01 修正 1#施工支洞 9.26 的三个时间段（并按半角/全角统一了人工归类规则）后上调一次，
+ * 这样已经同步过旧数据的设备会以"记录更新"的方式拿到修正值，而不是保留旧值。
+ */
+export const HISTORY_TS = Date.parse('2026-10-01T09:00:00+08:00')
 export const HISTORY_OPERATOR_ID = 'op-history'
 export const HISTORY_OPERATOR_NAME = '历史补录'
 

@@ -1,5 +1,5 @@
 {
- "generatedAt": "2026-09-30",
+ "generatedAt": "2026-10-01",
  "source": [
   "1#施工支洞循环作业施工记录.docx",
   "通风洞循环作业.docx",
@@ -372,7 +372,7 @@
   },
   {
    "face": "zd1",
-   "key": "s-drill",
+   "key": "s-survey",
    "date": "2026-09-21",
    "startTime": "22:20",
    "endTime": "22:55",
@@ -463,7 +463,7 @@
   },
   {
    "face": "zd1",
-   "key": "s-shot",
+   "key": "s-clean",
    "date": "2026-09-23",
    "startTime": "21:10",
    "endTime": "21:30",
@@ -814,7 +814,7 @@
   },
   {
    "face": "zd1",
-   "key": "s-grout",
+   "key": "s-clean",
    "date": "2026-09-26",
    "startTime": "03:10",
    "endTime": "03:45",
@@ -882,39 +882,39 @@
    "key": "m-drill",
    "date": "2026-09-26",
    "startTime": "20:18",
-   "endTime": "11:30",
-   "crossMidnight": true,
-   "hours": 15.2,
+   "endTime": "23:30",
+   "crossMidnight": false,
+   "hours": 3.2,
    "location": "0+41.4~0+44.1",
    "reason": null,
-   "abnormal": true,
-   "note": "20:18-11:30,0+41.4~0+44.1段打爆破孔9人 0+41.4~0+44.1段打爆破孔9人"
+   "abnormal": false,
+   "note": "20:18-23:30,0+41.4~0+44.1段打爆破孔9人 0+41.4~0+44.1段打爆破孔9人"
   },
   {
    "face": "zd1",
    "key": "m-check",
    "date": "2026-09-26",
-   "startTime": "11:40",
-   "endTime": "12:00",
-   "crossMidnight": false,
+   "startTime": "23:40",
+   "endTime": "00:00",
+   "crossMidnight": true,
    "hours": 0.3333,
    "location": "0+031~0+033.7",
    "reason": null,
    "abnormal": false,
-   "note": "11:40-12:00验孔 验孔"
+   "note": "23:40-0:00验孔 验孔"
   },
   {
    "face": "zd1",
    "key": "m-blast",
    "date": "2026-09-26",
-   "startTime": "12:00",
+   "startTime": "00:00",
    "endTime": "01:56",
-   "crossMidnight": true,
-   "hours": 13.9333,
+   "crossMidnight": false,
+   "hours": 1.9333,
    "location": "0+031~0+033.7",
    "reason": null,
-   "abnormal": true,
-   "note": "12:00-1:56装药响炮 装药响炮"
+   "abnormal": false,
+   "note": "0:00-1:56装药响炮 装药响炮"
   },
   {
    "face": "zd1",
@@ -1139,7 +1139,7 @@
   },
   {
    "face": "zd1",
-   "key": "m-drill",
+   "key": "s-blow",
    "date": "2026-09-28",
    "startTime": "10:20",
    "endTime": "11:37",
@@ -1152,7 +1152,7 @@
   },
   {
    "face": "zd1",
-   "key": "m-check",
+   "key": "s-check",
    "date": "2026-09-28",
    "startTime": "11:10",
    "endTime": "11:30",
@@ -1581,7 +1581,7 @@
   },
   {
    "face": "tf",
-   "key": "s-drill",
+   "key": "s-blow",
    "date": "2026-09-21",
    "startTime": "01:30",
    "endTime": "02:45",
@@ -1724,7 +1724,7 @@
   },
   {
    "face": "tf",
-   "key": "s-shot",
+   "key": "s-clean",
    "date": "2026-09-22",
    "startTime": "22:22",
    "endTime": "23:20",
@@ -1945,7 +1945,7 @@
   },
   {
    "face": "tf",
-   "key": "s-grout",
+   "key": "s-mesh",
    "date": "2026-09-24",
    "startTime": "13:50",
    "endTime": "22:30",
@@ -1971,7 +1971,7 @@
   },
   {
    "face": "tf",
-   "key": "s-shot",
+   "key": "s-clean",
    "date": "2026-09-24",
    "startTime": "22:35",
    "endTime": "23:00",
@@ -2056,7 +2056,7 @@
    "crossMidnight": false,
    "hours": 4.9167,
    "location": "0+456~0+459",
-   "reason": null,
+   "reason": "explosive",
    "abnormal": false,
    "note": "10:45-15:40（1#洞装药,系统问题需要重新出库） （1#洞装药,系统问题需要重新出库）"
   },
@@ -2491,7 +2491,7 @@
   },
   {
    "face": "tf",
-   "key": "s-drill",
+   "key": "s-survey",
    "date": "2026-09-29",
    "startTime": "07:55",
    "endTime": "08:40",
@@ -2749,8 +2749,8 @@
    "face": "zd1",
    "key": "m-check",
    "name": "爆破孔验收",
-   "count": 15,
-   "median": 0.333,
+   "count": 14,
+   "median": 0.317,
    "min": 0.15,
    "max": 0.833,
    "enough": true
@@ -2759,8 +2759,8 @@
    "face": "zd1",
    "key": "m-blast",
    "name": "装药爆破",
-   "count": 15,
-   "median": 1.767,
+   "count": 16,
+   "median": 1.792,
    "min": 0.767,
    "max": 2.45,
    "enough": true
@@ -2809,8 +2809,8 @@
    "face": "zd1",
    "key": "s-survey",
    "name": "测量放样（锚杆孔）",
-   "count": 2,
-   "median": 0.908,
+   "count": 3,
+   "median": 0.583,
    "min": 0.483,
    "max": 1.333,
    "enough": false
@@ -2819,27 +2819,27 @@
    "face": "zd1",
    "key": "s-drill",
    "name": "锚杆孔钻孔",
-   "count": 5,
-   "median": 2.5,
-   "min": 0.583,
+   "count": 4,
+   "median": 2.558,
+   "min": 2.0,
    "max": 3.75,
-   "enough": true
+   "enough": false
   },
   {
    "face": "zd1",
    "key": "s-blow",
    "name": "吹孔",
-   "count": 1,
-   "median": 0.5,
+   "count": 2,
+   "median": 0.892,
    "min": 0.5,
-   "max": 0.5,
+   "max": 1.283,
    "enough": false
   },
   {
    "face": "zd1",
    "key": "s-check",
    "name": "锚杆孔验收",
-   "count": 3,
+   "count": 4,
    "median": 0.333,
    "min": 0.167,
    "max": 0.583,
@@ -2849,9 +2849,9 @@
    "face": "zd1",
    "key": "s-grout",
    "name": "锚杆注浆",
-   "count": 7,
-   "median": 4.0,
-   "min": 0.583,
+   "count": 6,
+   "median": 4.317,
+   "min": 0.75,
    "max": 11.583,
    "enough": true
   },
@@ -2879,9 +2879,9 @@
    "face": "zd1",
    "key": "s-shot",
    "name": "喷护",
-   "count": 6,
-   "median": 1.75,
-   "min": 0.333,
+   "count": 5,
+   "median": 2.083,
+   "min": 1.0,
    "max": 4.333,
    "enough": true
   },
@@ -2889,7 +2889,7 @@
    "face": "zd1",
    "key": "s-clean",
    "name": "清理回弹料",
-   "count": 5,
+   "count": 7,
    "median": 0.583,
    "min": 0.25,
    "max": 1.333,
@@ -2959,8 +2959,8 @@
    "face": "tf",
    "key": "s-survey",
    "name": "测量放样（锚杆孔）",
-   "count": 2,
-   "median": 0.708,
+   "count": 3,
+   "median": 0.75,
    "min": 0.583,
    "max": 0.833,
    "enough": false
@@ -2969,11 +2969,21 @@
    "face": "tf",
    "key": "s-drill",
    "name": "锚杆孔钻孔",
-   "count": 7,
-   "median": 1.25,
+   "count": 5,
+   "median": 3.5,
    "min": 0.417,
    "max": 4.5,
    "enough": true
+  },
+  {
+   "face": "tf",
+   "key": "s-blow",
+   "name": "吹孔",
+   "count": 1,
+   "median": 1.25,
+   "min": 1.25,
+   "max": 1.25,
+   "enough": false
   },
   {
    "face": "tf",
@@ -2989,18 +2999,18 @@
    "face": "tf",
    "key": "s-grout",
    "name": "锚杆注浆",
-   "count": 5,
-   "median": 5.0,
+   "count": 4,
+   "median": 4.25,
    "min": 0.833,
-   "max": 8.667,
-   "enough": true
+   "max": 6.0,
+   "enough": false
   },
   {
    "face": "tf",
    "key": "s-mesh",
    "name": "挂钢筋网",
-   "count": 5,
-   "median": 6.333,
+   "count": 6,
+   "median": 7.208,
    "min": 2.583,
    "max": 9.083,
    "enough": true
@@ -3019,20 +3029,20 @@
    "face": "tf",
    "key": "s-shot",
    "name": "喷护",
-   "count": 5,
-   "median": 2.333,
-   "min": 0.417,
+   "count": 3,
+   "median": 2.667,
+   "min": 2.333,
    "max": 3.0,
-   "enough": true
+   "enough": false
   },
   {
    "face": "tf",
    "key": "s-clean",
    "name": "清理回弹料",
-   "count": 5,
+   "count": 7,
    "median": 0.5,
    "min": 0.283,
-   "max": 0.583,
+   "max": 0.967,
    "enough": true
   },
   {
