@@ -1,25 +1,33 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
+import ScopePicker from '@/components/ScopePicker.vue'
 import { state } from '@/store'
-import { computeGapRows, computeStats } from '@/core/compute'
+import { computeGapRows } from '@/core/compute'
+import { filterByScope } from '@/core/scope'
 import { reasonLabel } from '@/core/reasons'
 import { addMonths, endOfMonth, fmtHoursShort, friendlyDate, monthKey, todayStr } from '@/core/time'
 
 const router = useRouter()
-const month = ref(monthKey(todayStr()))
+const route = useRoute()
+// 从看板跳过来时带着月份，避免"看的是 9 月、翻到明细却是 10 月"的困惑
+const month = ref(typeof route.query.month === 'string' && /^\d{4}-\d{2}$/.test(route.query.month) ? route.query.month : monthKey(todayStr()))
 const keyword = ref('')
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
 
+/** 先按分析范围过滤，再按月份与关键词过滤 */
+const scopeRecords = computed(() => filterByScope(state.records, state.scope, processById.value, wbsById.value))
+
 const from = computed(() => `${month.value}-01`)
 const to = computed(() => endOfMonth(from.value))
 
 const monthRecords = computed(() =>
-  state.records.filter((r) => r.date >= from.value && r.date <= to.value)
+  scopeRecords.value.filter((r) => r.date >= from.value && r.date <= to.value)
 )
 
+/** 空隙要在"范围内的整月记录"上算，否则关键词筛选会打断工序衔接 */
 const gapByRecord = computed(() => {
   const rows = computeGapRows(monthRecords.value, processById.value)
   return new Map(rows.map((g) => [g.recordId, g.gapHours]))
@@ -30,13 +38,33 @@ const filtered = computed(() => {
   const list = kw
     ? monthRecords.value.filter((r) => {
         const p = processById.value.get(r.processId)
-        return (p?.name ?? '').includes(kw) || (r.location ?? '').includes(kw) || (r.note ?? '').includes(kw)
+        return (
+          (p?.name ?? '').includes(kw) ||
+          (r.location ?? '').includes(kw) ||
+          (r.note ?? '').includes(kw)
+        )
       })
     : monthRecords.value
   return [...list].sort((a, b) => b.startAt - a.startAt)
 })
 
-const stats = computed(() => computeStats(state.records, processById.value, from.value, to.value))
+/** 顶部统计跟随筛选结果，避免数字和列表对不上 */
+const filteredStats = computed(() => {
+  const rows = filtered.value
+  const hours = rows.reduce((s, r) => s + (Number.isFinite(r.hours) ? r.hours : 0), 0)
+  const gap = rows.reduce((s, r) => s + (gapByRecord.value.get(r.id) ?? 0), 0)
+  const days = new Set(rows.map((r) => r.date)).size
+  return { count: rows.length, hours, gap, days }
+})
+
+const scopeName = computed(() => {
+  const s = state.scope
+  if (s.level === 'all') return '全部工程'
+  if (s.level === 'unit') return wbsById.value.get(s.unitId ?? '')?.name ?? ''
+  const item = wbsById.value.get(s.itemId ?? '')?.name ?? ''
+  const proc = s.processId ? processById.value.get(s.processId) : undefined
+  return proc ? `${item} · ${proc.name}` : item
+})
 
 const grouped = computed(() => {
   const map = new Map<string, typeof filtered.value>()
@@ -65,31 +93,37 @@ function changeMonth(delta: number) {
   <van-nav-bar title="记录明细" fixed placeholder />
 
   <div class="page">
+    <ScopePicker />
+
     <div class="card">
       <div class="row-between">
         <van-icon name="arrow-left" size="18" @click="changeMonth(-1)" />
         <div class="num" style="font-size: 16px; font-weight: 600">{{ month }}</div>
         <van-icon name="arrow" size="18" @click="changeMonth(1)" />
       </div>
+      <div class="muted scope-echo" style="text-align: center; margin-top: 4px">
+        {{ scopeName }}
+      </div>
       <div class="divider" />
       <div class="kpi-grid">
         <div>
-          <div class="muted">本月记录</div>
-          <div class="num" style="font-size: 18px; font-weight: 600">{{ stats.recordCount }} 条</div>
+          <div class="muted">记录条数</div>
+          <div class="num" style="font-size: 18px; font-weight: 600">{{ filteredStats.count }} 条</div>
         </div>
         <div>
-          <div class="muted">本月工时</div>
-          <div class="num" style="font-size: 18px; font-weight: 600">{{ fmtHoursShort(stats.actualHours) }}</div>
+          <div class="muted">合计工时</div>
+          <div class="num" style="font-size: 18px; font-weight: 600">{{ fmtHoursShort(filteredStats.hours) }}</div>
         </div>
       </div>
       <div class="muted" style="margin-top: 6px">
-        衔接空隙合计 {{ fmtHoursShort(stats.gapHours) }} · 有效施工天数 {{ stats.activeDays }} 天
+        衔接空隙合计 {{ fmtHoursShort(filteredStats.gap) }} · 有记录天数 {{ filteredStats.days }} 天
+        <template v-if="keyword"> （已按“{{ keyword }}”筛选）</template>
       </div>
     </div>
 
     <van-search v-model="keyword" placeholder="搜索工序 / 部位 / 备注" />
 
-    <van-empty v-if="!grouped.length" description="这个月还没有记录" image-size="72" />
+    <van-empty v-if="!grouped.length" description="当前范围与月份内没有记录" image-size="72" />
 
     <div v-for="[date, rows] in grouped" :key="date" class="card">
       <div class="card-title">
@@ -153,5 +187,9 @@ function changeMonth(delta: number) {
 
 .gap {
   color: #b26a00;
+}
+
+.scope-echo {
+  word-break: break-all;
 }
 </style>

@@ -12,6 +12,7 @@ import {
   setKv
 } from '@/db'
 import { syncNow, syncState as readSyncState, type SyncBackend } from '@/sync'
+import { ALL_SCOPE, scopeLabel, scopedProcessIds, type AnalysisScope } from '@/core/scope'
 
 export interface SyncViewState {
   configured: boolean
@@ -34,6 +35,8 @@ interface AppState {
   processes: Process[]
   records: ProcessRecord[]
   sync: SyncViewState
+  /** 当前分析范围（看板与明细页共用） */
+  scope: AnalysisScope
 }
 
 export const state = reactive<AppState>({
@@ -54,7 +57,8 @@ export const state = reactive<AppState>({
     syncing: false,
     message: '',
     error: false
-  }
+  },
+  scope: { ...ALL_SCOPE } as AnalysisScope
 })
 
 let syncTimer: number | undefined
@@ -126,8 +130,32 @@ export async function refreshAll(): Promise<void> {
 export async function setProject(id: string): Promise<void> {
   state.currentProjectId = id
   await setKv('ui.currentProjectId', id)
+  // 换了项目，之前的分析范围不再适用
+  await setScope({ ...ALL_SCOPE })
   await refreshStructure()
   await refreshRecords()
+}
+
+/** 分析范围（看板 / 明细页共用，本机持久化，不参与同步） */
+export async function setScope(scope: AnalysisScope): Promise<void> {
+  // 注意：不能把 Vue 的响应式对象直接交给 IndexedDB，结构化克隆不支持 Proxy，
+  // 会报 DataCloneError。这里显式构造一个普通对象。
+  const plain: AnalysisScope = {
+    level: scope.level,
+    unitId: scope.unitId,
+    itemId: scope.itemId,
+    processId: scope.processId
+  }
+  state.scope = plain
+  await setKv('ui.scope', { projectId: state.currentProjectId, scope: plain })
+}
+
+export function scopeProcessIds(): Set<string> | null {
+  return scopedProcessIds(state.scope, processMap(), wbsMap())
+}
+
+export function scopeText(): string {
+  return scopeLabel(state.scope, wbsMap(), processMap())
 }
 
 export async function setOperator(id: string): Promise<void> {
@@ -148,6 +176,9 @@ export async function initApp(): Promise<void> {
   state.currentProjectId = await getKv<string>('ui.currentProjectId', '')
   state.currentOperatorId = await getKv<string>('ui.currentOperatorId', '')
   await refreshAll()
+
+  const savedScope = await getKv<{ projectId: string; scope: AnalysisScope } | null>('ui.scope', null)
+  state.scope = savedScope && savedScope.projectId === state.currentProjectId ? savedScope.scope : { ...ALL_SCOPE }
 
   // 首次使用自动建一个默认操作人，避免录入时无法选人
   if (!state.operators.length) {

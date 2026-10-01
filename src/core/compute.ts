@@ -39,6 +39,22 @@ export function isActive<T extends { deletedAt?: number }>(row: T): boolean {
   return !row.deletedAt
 }
 
+/** 每条记录参与效率计算时用的基准：标准用时优先，没填就用实测参考用时 */
+export function baselineHoursOf(process?: Process): number | null {
+  if (!process) return null
+  if (process.standardHours && process.standardHours > 0) return process.standardHours
+  if (process.refHours && process.refHours > 0) return process.refHours
+  return null
+}
+
+/** 该工序用的是标准基准还是参考基准 */
+export function baselineKindOf(process?: Process): 'standard' | 'reference' | null {
+  if (!process) return null
+  if (process.standardHours && process.standardHours > 0) return 'standard'
+  if (process.refHours && process.refHours > 0) return 'reference'
+  return null
+}
+
 export function activeRecords(records: ProcessRecord[]): ProcessRecord[] {
   return records.filter(isActive)
 }
@@ -132,8 +148,14 @@ export interface PeriodStats {
   to: ISODate
   recordCount: number
   actualHours: number
+  /** 只统计填了标准用时的记录 */
   standardHours: number
   standardCovered: number
+  /** 参与效率计算的基准工时合计（标准优先，缺失时用参考用时） */
+  baselineHours: number
+  baselineCovered: number
+  /** 基准来源：standard=全部用标准 / reference=全部用参考 / mixed=两者混合 / none=都没有 */
+  baselineSource: 'standard' | 'reference' | 'mixed' | 'none'
   gapHours: number
   gapCount: number
   /** 总量口径：Σ标准 ÷ Σ实际 − 1 */
@@ -154,6 +176,9 @@ export function computeStats(
   let actualHours = 0
   let standardHours = 0
   let standardCovered = 0
+  let baselineHours = 0
+  let baselineCovered = 0
+  let referenceOnly = 0
   let quantity = 0
   const deviations: number[] = []
   const days = new Set<string>()
@@ -163,16 +188,32 @@ export function computeStats(
     actualHours += hours
     quantity += Number(r.quantity) || 0
     days.add(r.date)
-    const std = processById.get(r.processId)?.standardHours
+    const process = processById.get(r.processId)
+    const std = process?.standardHours
     if (std && std > 0) {
       standardHours += std
       standardCovered += 1
-      deviations.push((std - hours) / std)
+    }
+    const base = baselineHoursOf(process)
+    if (base && base > 0) {
+      baselineHours += base
+      baselineCovered += 1
+      deviations.push((base - hours) / base)
+      if (!(std && std > 0)) referenceOnly += 1
     }
   })
 
   const gaps = computeGapRows(rows, processById)
   const gapHours = gaps.reduce((s, g) => s + g.gapHours, 0)
+
+  const baselineSource: PeriodStats['baselineSource'] =
+    baselineCovered === 0
+      ? 'none'
+      : referenceOnly === 0
+        ? 'standard'
+        : referenceOnly === baselineCovered
+          ? 'reference'
+          : 'mixed'
 
   return {
     from,
@@ -181,9 +222,12 @@ export function computeStats(
     actualHours,
     standardHours,
     standardCovered,
+    baselineHours,
+    baselineCovered,
+    baselineSource,
     gapHours,
     gapCount: gaps.length,
-    totalEfficiency: standardHours > 0 && actualHours > 0 ? standardHours / actualHours - 1 : null,
+    totalEfficiency: baselineHours > 0 && actualHours > 0 ? baselineHours / actualHours - 1 : null,
     avgDeviation: deviations.length
       ? deviations.reduce((s, v) => s + v, 0) / deviations.length
       : null,
@@ -205,6 +249,10 @@ export interface ProcessAgg {
   /** 实测参考用时（模板预置），标准用时未填时用于对比展示 */
   refHours: number | null
   refTotal: number | null
+  /** 参与对比的基准（标准优先，缺失时用参考） */
+  baselineHours: number | null
+  baselineTotal: number | null
+  baselineKind: 'standard' | 'reference' | null
   deviation: number | null
   quantity: number
   designQty: number | null
@@ -236,6 +284,9 @@ export function aggregateByProcess(
         standardTotal: null,
         refHours: p.refHours ?? null,
         refTotal: null,
+        baselineHours: baselineHoursOf(p),
+        baselineTotal: null,
+        baselineKind: baselineKindOf(p),
         deviation: null,
         quantity: 0,
         designQty: p.designQty ?? null
@@ -249,10 +300,13 @@ export function aggregateByProcess(
   out.forEach((row) => {
     if (row.standardHours && row.standardHours > 0) {
       row.standardTotal = row.standardHours * row.count
-      row.deviation = (row.standardTotal - row.actualHours) / row.standardTotal
     }
     if (row.refHours && row.refHours > 0) {
       row.refTotal = row.refHours * row.count
+    }
+    if (row.baselineHours && row.baselineHours > 0) {
+      row.baselineTotal = row.baselineHours * row.count
+      row.deviation = (row.baselineTotal - row.actualHours) / row.baselineTotal
     }
   })
   return out.sort((a, b) => b.actualHours - a.actualHours)
@@ -288,6 +342,7 @@ export interface GapAgg {
   recordId: string
   processName: string
   prevProcessName: string
+  itemId: string
   date: ISODate
   gapHours: number
   reason: string
@@ -303,6 +358,7 @@ export function topGaps(gaps: GapRow[], limit = 10): GapAgg[] {
       recordId: g.recordId,
       processName: g.processName,
       prevProcessName: g.prevProcessName,
+      itemId: g.itemId,
       date: g.date,
       gapHours: g.gapHours,
       reason: g.reason,
