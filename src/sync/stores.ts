@@ -76,11 +76,30 @@ function ghHeaders(pat: string): Record<string, string> {
   }
 }
 
-async function readError(res: Response, what: string): Promise<string> {
+/** 把接口返回的错误体压成一句人话（Gitee 的 error 可能是嵌套对象，直接 String() 会变成 [object Object]） */
+export function errorTextOf(body: unknown): string {
+  const pick = (v: unknown): string => {
+    if (v === null || v === undefined) return ''
+    if (typeof v === 'string') return v
+    if (typeof v === 'number' || typeof v === 'boolean') return String(v)
+    if (Array.isArray(v)) return v.map(pick).filter(Boolean).join('；')
+    if (typeof v === 'object') {
+      return Object.values(v as Record<string, unknown>)
+        .map(pick)
+        .filter(Boolean)
+        .join('；')
+    }
+    return ''
+  }
+  if (!body || typeof body !== 'object') return typeof body === 'string' ? body : ''
+  const obj = body as Record<string, unknown>
+  return [pick(obj.message), pick(obj.error)].filter(Boolean).join('；')
+}
+
+export async function readError(res: Response, what: string): Promise<string> {
   let detail = ''
   try {
-    const body = (await res.json()) as { message?: string; error?: string }
-    detail = body.message ?? body.error ?? ''
+    detail = errorTextOf(await res.json())
   } catch {
     detail = ''
   }
@@ -189,6 +208,16 @@ export class GiteeStore implements RemoteStore {
     return this.dir.replace(/^\/+|\/+$/g, '')
   }
 
+  /** 404 时把"当前填的仓库名"回显出来，方便核对是不是打错字 */
+  private async fail(res: Response, what: string): Promise<Error> {
+    if (res.status === 404) {
+      return new Error(
+        `${what}：数据空间不存在或无权访问（404）——当前“数据仓库”填的是「${this.repo}」，请核对是否与 Gitee 上的地址完全一致（注意连字符，例如 youzero/gongxu-data）`
+      )
+    }
+    return new Error(await readError(res, what))
+  }
+
   private filePath(name: string): string {
     const dir = this.dirPath()
     return dir ? `${dir}/${name}` : name
@@ -200,7 +229,7 @@ export class GiteeStore implements RemoteStore {
       headers: { Accept: 'application/json' }
     })
     if (res.status === 404) return []
-    if (!res.ok) throw new Error(await readError(res, 'Gitee 同步'))
+    if (!res.ok) throw await this.fail(res, 'Gitee 同步')
     const body = (await res.json()) as GiteeEntry[] | GiteeEntry
     return Array.isArray(body) ? body : [body]
   }
@@ -209,7 +238,7 @@ export class GiteeStore implements RemoteStore {
     const res = await fetchWithTimeout(this.url(path.split('/').map(encodeURIComponent).join('/')), {
       headers: { Accept: 'application/json' }
     })
-    if (!res.ok) throw new Error(await readError(res, 'Gitee 同步'))
+    if (!res.ok) throw await this.fail(res, 'Gitee 同步')
     const entry = (await res.json()) as GiteeEntry
     this.shas[entry.name] = entry.sha
     if (!entry.content) {
@@ -243,7 +272,7 @@ export class GiteeStore implements RemoteStore {
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
         body: JSON.stringify(sha ? { ...body, sha } : body)
       })
-      if (!res.ok) throw new Error(await readError(res, 'Gitee 同步'))
+      if (!res.ok) throw await this.fail(res, 'Gitee 同步')
       const saved = (await res.json()) as { content?: { sha?: string } }
       if (saved.content?.sha) this.shas[name] = saved.content.sha
     }
@@ -316,7 +345,22 @@ export async function runDiagnostics(): Promise<ProbeResult[]> {
   return out
 }
 
-/** 创建 Gitee 私有数据仓库 */
+/** 在账号下按名字找仓库（用于"仓库已存在"时复用） */
+async function findGiteeRepo(token: string, name: string): Promise<string | null> {
+  const res = await fetchWithTimeout(
+    `${GITEE_API}/user/repos?access_token=${encodeURIComponent(token)}&per_page=100&sort=updated`,
+    { headers: { Accept: 'application/json' } }
+  )
+  if (!res.ok) return null
+  const list = (await res.json()) as Array<{ full_name?: string; name?: string }>
+  const hit = list.find((r) => (r.name ?? '').toLowerCase() === name.toLowerCase())
+  return hit?.full_name ?? null
+}
+
+/**
+ * 创建 Gitee 私有数据仓库。
+ * 如果同名仓库已经存在（第二台手机走同样的流程时必然如此），直接复用而不是报错。
+ */
 export async function createGiteeRepo(token: string, name: string, description: string): Promise<string> {
   const body = new URLSearchParams({
     access_token: token,
@@ -332,10 +376,28 @@ export async function createGiteeRepo(token: string, name: string, description: 
     headers: { 'Content-Type': 'application/x-www-form-urlencoded', Accept: 'application/json' },
     body: body.toString()
   })
-  if (!res.ok) throw new Error(await readError(res, '创建 Gitee 仓库'))
-  const repo = (await res.json()) as { full_name?: string }
-  if (!repo.full_name) throw new Error('创建 Gitee 仓库成功但未返回仓库名')
-  return repo.full_name
+  if (res.ok) {
+    const repo = (await res.json()) as { full_name?: string }
+    if (repo.full_name) return repo.full_name
+    throw new Error('创建 Gitee 仓库成功但未返回仓库名')
+  }
+
+  const raw = await res.text().catch(() => '')
+  if (/已存在|already exists|already been taken/i.test(raw) || res.status === 422) {
+    const existing = await findGiteeRepo(token, name)
+    if (existing) return existing
+  }
+  let detail = ''
+  try {
+    detail = errorTextOf(JSON.parse(raw))
+  } catch {
+    detail = raw.slice(0, 120)
+  }
+  throw new Error(
+    `创建 Gitee 仓库：请求被拒绝（${res.status}${detail ? '：' + detail : ''}）。` +
+      '若仓库已存在可忽略本步，直接填“数据仓库”后点“测试连接”“立即同步”；' +
+      '若提示权限不足，请确认私人令牌勾选了 projects 权限且账号已完成实名认证'
+  )
 }
 
 /** 创建新的私密 Gist（保留 GitHub 方案时使用） */

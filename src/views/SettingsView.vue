@@ -82,7 +82,13 @@ async function doCreateSpace() {
     if (res.repo) syncCfg.giteeRepo = res.repo
     if (res.gistId) syncCfg.gistId = res.gistId
     await persistSync()
-    showToast(isGitee ? `已创建私有仓库 ${res.repo} 并写入初始文件` : '数据空间已创建并保存')
+    if (!isGitee) {
+      showToast('数据空间已创建并保存')
+    } else if (res.reused) {
+      showToast(`已连接现有数据仓库 ${res.repo}（云端已有数据，未覆盖），现在可以点“立即同步”`)
+    } else {
+      showToast(`已创建私有仓库 ${res.repo} 并写入初始文件`)
+    }
   } catch (err) {
     showToast(err instanceof Error ? err.message : '创建失败')
   } finally {

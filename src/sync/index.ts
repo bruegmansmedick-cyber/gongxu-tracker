@@ -84,7 +84,10 @@ export function isConfigured(cfg: SyncConfig): boolean {
 }
 
 /** 创建数据空间：Gitee 建私有仓库，GitHub 建私密 Gist */
-export async function createDataSpace(cfg: SyncConfig, deviceId: string): Promise<{ gistId?: string; repo?: string }> {
+export async function createDataSpace(
+  cfg: SyncConfig,
+  deviceId: string
+): Promise<{ gistId?: string; repo?: string; reused?: boolean }> {
   const meta: MetaPayload = { schemaVersion: 1, updatedAt: Date.now(), deviceId }
   const catalog = await readCatalogPayload()
   const files = {
@@ -98,8 +101,11 @@ export async function createDataSpace(cfg: SyncConfig, deviceId: string): Promis
       '工序用时记录与效率分析（私有数据仓库，勿公开）'
     )
     const store = createStore({ ...cfg, giteeRepo: repo })
-    await store.writeFiles(files)
-    return { repo }
+    // 云端已经有数据时绝不能覆盖（第二台手机走同样流程时必然命中这种情况）
+    const existing = await store.readAll().catch(() => ({}) as Record<string, string>)
+    const hasData = Object.keys(existing).some((n) => n === 'catalog.json' || n.startsWith('records-'))
+    if (!hasData) await store.writeFiles(files)
+    return { repo, reused: hasData }
   }
   const gistId = await createGist(cfg.githubToken.trim(), files)
   return { gistId }

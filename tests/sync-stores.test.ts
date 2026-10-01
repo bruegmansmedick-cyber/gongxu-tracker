@@ -1,5 +1,13 @@
 import { describe, expect, it } from 'vitest'
-import { GistStore, GiteeStore, createStore, fromBase64, payloadSize, toBase64 } from '@/sync/stores'
+import {
+  GistStore,
+  GiteeStore,
+  createStore,
+  errorTextOf,
+  fromBase64,
+  payloadSize,
+  toBase64
+} from '@/sync/stores'
 import type { SyncConfig } from '@/sync/stores'
 
 const base: SyncConfig = {
@@ -48,5 +56,23 @@ describe('后端选择', () => {
     const gist = createStore({ ...base, backend: 'gist', githubToken: 'tok', gistId: 'abc' })
     expect(gist).toBeInstanceOf(GistStore)
     expect(gist.label).toContain('GitHub')
+  })
+})
+
+describe('接口错误信息渲染', () => {
+  it('Gitee 的嵌套 error 对象不会被渲染成 [object Object]', () => {
+    expect(errorTextOf({ error: { base: ['已存在同地址仓库（忽略大小写）'] } })).toBe(
+      '已存在同地址仓库（忽略大小写）'
+    )
+  })
+
+  it('多层嵌套会按顺序拼接', () => {
+    expect(errorTextOf({ error: { a: ['x', 'y'], b: 'z' } })).toBe('x；y；z')
+  })
+
+  it('GitHub 风格的单层 message 与空值都能处理', () => {
+    expect(errorTextOf({ message: 'Not Found Project' })).toBe('Not Found Project')
+    expect(errorTextOf(null)).toBe('')
+    expect(errorTextOf(undefined)).toBe('')
   })
 })
