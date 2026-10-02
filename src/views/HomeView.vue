@@ -7,6 +7,7 @@ import { applyBenchTemplate, saveProject, seedHistoryRecords } from '@/db'
 import { BENCH_PROJECT_ID, BENCH_PROJECT_NAME, HISTORY_FACES } from '@/db/seed'
 import { HISTORY_ROWS } from '@/db/history'
 import { computeStats, recordsOfDate } from '@/core/compute'
+import { shortKind, shortSpot } from '@/core/scope'
 import type { Process, ProcessRecord } from '@/types'
 import { endOfWeek, fmtHoursShort, friendlyDate, startOfWeek, todayStr } from '@/core/time'
 import { reasonLabel } from '@/core/reasons'
@@ -60,8 +61,21 @@ const groups = computed<Group[]>(() => {
   return Array.from(map.values())
 })
 
-/** 最近两周用过的工序，用于一键补录 */
-const recentProcesses = computed<Process[]>(() => {
+/**
+ * 最近两周用过的工序，按分项工程（工作面）分成小组，用于一键补录。
+ * 组标题只给最短的提示（如"1#支洞""通风洞"），组内是这个工作面常记的工序。
+ */
+interface RecentGroup {
+  itemId: string
+  label: string
+  processes: Process[]
+}
+
+/** 每个工作组最多列几道工序、最多列几个组 */
+const GROUP_LIMIT = 5
+const GROUP_PROCESS_LIMIT = 4
+
+const recentGroups = computed<RecentGroup[]>(() => {
   const since = new Date(Date.now() - 14 * 86400000)
   const sinceStr = `${since.getFullYear()}-${String(since.getMonth() + 1).padStart(2, '0')}-${String(
     since.getDate()
@@ -71,11 +85,41 @@ const recentProcesses = computed<Process[]>(() => {
     if (r.date < sinceStr) return
     counter.set(r.processId, (counter.get(r.processId) ?? 0) + 1)
   })
-  return Array.from(counter.entries())
+
+  const byItem = new Map<string, Process[]>()
+  const groupCount = new Map<string, number>()
+  Array.from(counter.entries())
     .sort((a, b) => b[1] - a[1])
-    .map(([id]) => processById.value.get(id))
-    .filter((p): p is Process => !!p)
-    .slice(0, 8)
+    .forEach(([processId, times]) => {
+      const p = processById.value.get(processId)
+      if (!p) return
+      const list = byItem.get(p.itemId) ?? []
+      list.push(p)
+      byItem.set(p.itemId, list)
+      groupCount.set(p.itemId, (groupCount.get(p.itemId) ?? 0) + times)
+    })
+
+  const raw = Array.from(byItem.entries())
+    .map(([itemId, list]) => ({
+      itemId,
+      itemName: wbsById.value.get(itemId)?.name ?? '未归类',
+      processes: list.slice(0, GROUP_PROCESS_LIMIT),
+      total: groupCount.get(itemId) ?? 0
+    }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, GROUP_LIMIT)
+
+  // 同一工作面有好几个分项时（比如 1#支洞 既有开挖又有支护），标题补一个工序类别，免得两组同名
+  const spotCount = new Map<string, number>()
+  raw.forEach((g) => {
+    const spot = shortSpot(g.itemName)
+    spotCount.set(spot, (spotCount.get(spot) ?? 0) + 1)
+  })
+  return raw.map((g) => {
+    const spot = shortSpot(g.itemName)
+    const label = (spotCount.get(spot) ?? 0) > 1 ? `${spot}·${shortKind(g.itemName)}` : spot
+    return { itemId: g.itemId, label, processes: g.processes }
+  })
 })
 
 const projectActions = computed(() =>
@@ -241,15 +285,18 @@ async function onRefresh() {
           </div>
         </div>
 
-        <div v-if="recentProcesses.length" class="card">
+        <div v-if="recentGroups.length" class="card">
           <div class="card-title">
             常用工序（近两周）
             <span class="sub">点一下直接记录</span>
           </div>
-          <div class="chips">
-            <button v-for="p in recentProcesses" :key="p.id" class="chip" @click="addRecord(p.id)">
-              {{ p.name }}
-            </button>
+          <div v-for="g in recentGroups" :key="g.itemId" class="recent-group">
+            <div class="recent-label">{{ g.label }}</div>
+            <div class="chips">
+              <button v-for="p in g.processes" :key="p.id" class="chip" @click="addRecord(p.id)">
+                {{ p.name }}
+              </button>
+            </div>
           </div>
         </div>
       </template>
@@ -345,6 +392,16 @@ async function onRefresh() {
   flex-wrap: wrap;
   gap: 8px;
 }
+
+  .recent-group + .recent-group {
+    margin-top: 12px;
+  }
+
+  .recent-label {
+    font-size: 12px;
+    color: #8b95a1;
+    margin-bottom: 6px;
+  }
 
 .chip {
   border: 1px solid #dfe4ea;

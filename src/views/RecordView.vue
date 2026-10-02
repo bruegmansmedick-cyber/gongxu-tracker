@@ -8,6 +8,7 @@ import { buildTimeFields, suggestStandardHours } from '@/core/compute'
 import { checkBeforeSave } from '@/core/health'
 import { GAP_REASONS } from '@/core/reasons'
 import { recommendProcesses, rememberProcess, type ProcessMemory } from '@/core/recommend'
+import { buildUsageIndex, predictSelection, rankByUsage } from '@/core/predict'
 import { addDays, fmtDate, fmtHours, friendlyDate, nowHhmm, todayStr } from '@/core/time'
 import type { Process, WbsLevel, WbsNode } from '@/types'
 
@@ -74,8 +75,15 @@ function childrenOf(parentId: string | null, level: WbsLevel): WbsNode[] {
 }
 
 const units = computed(() => childrenOf(null, 1))
-const divisions = computed(() => (unitId.value ? childrenOf(unitId.value, 2) : []))
-const items = computed(() => (divisionId.value ? childrenOf(divisionId.value, 3) : []))
+/** 使用习惯：最近常记的单位 / 分部 / 分项 / 工序排前面（已完工、没开工的自然沉下去） */
+const usageIndex = computed(() => buildUsageIndex(state.records, processById.value, wbsById.value))
+const orderedUnits = computed(() => rankByUsage(units.value, usageIndex.value))
+const orderedDivisions = computed(() =>
+  unitId.value ? rankByUsage(childrenOf(unitId.value, 2), usageIndex.value) : []
+)
+const orderedItems = computed(() =>
+  divisionId.value ? rankByUsage(childrenOf(divisionId.value, 3), usageIndex.value) : []
+)
 
 const unit = computed(() => wbsById.value.get(unitId.value))
 const division = computed(() => wbsById.value.get(divisionId.value))
@@ -84,8 +92,15 @@ const selectedProcess = computed(() => processById.value.get(processId.value))
 
 /** 该分项下已有的工序（工程管理里建的、别的设备同步过来的都算） */
 const itemProcesses = computed(() =>
-  state.processes.filter((p) => p.itemId === itemId.value && p.enabled).sort((a, b) => a.sort - b.sort)
+  rankByUsage(
+    state.processes.filter((p) => p.itemId === itemId.value && p.enabled),
+    usageIndex.value
+  )
 )
+
+/** 预判标记：这一级是系统按近期常用自动填的，不是人选的 */
+const predicted = reactive({ division: false, item: false })
+const predictedHint = ref('')
 
 /** 推荐 = 本分项已有 + 同类分项用过（记忆）+ 按项目划分匹配的通用工序 */
 const recommendation = computed(() =>
@@ -105,12 +120,12 @@ const pickerTitle = computed(() => {
 })
 
 const pickerOptions = computed<WbsNode[]>(() => {
-  if (pickerLevel.value === 'unit') return units.value
-  if (pickerLevel.value === 'division') return divisions.value
+  if (pickerLevel.value === 'unit') return orderedUnits.value
+  if (pickerLevel.value === 'division') return orderedDivisions.value
   if (pickerLevel.value !== 'item') return []
   const kw = search.value.trim()
-  if (!kw) return items.value
-  return items.value.filter((i) => i.name.includes(kw) || (i.note ?? '').includes(kw))
+  if (!kw) return orderedItems.value
+  return orderedItems.value.filter((i) => i.name.includes(kw) || (i.note ?? '').includes(kw))
 })
 
 const currentPickId = computed(() => {
@@ -141,6 +156,38 @@ function openPicker(level: 'unit' | 'division' | 'item') {
   pickerLevel.value = level
 }
 
+/**
+ * 按近期使用习惯预判下一级并自动填上（可改）。
+ * 只在真的有使用记录时才预判；给不出结果就什么都不做。
+ */
+function applyPrediction(from: 'unit' | 'division') {
+  predicted.division = false
+  predicted.item = false
+  predictedHint.value = ''
+  const res = predictSelection({
+    unitId: unitId.value,
+    divisionId: from === 'division' ? divisionId.value : '',
+    wbs: state.wbs,
+    index: usageIndex.value,
+    processes: state.processes
+  })
+  if (from === 'unit' && res.divisionId) {
+    divisionId.value = res.divisionId
+    predicted.division = true
+  }
+  if (res.itemId) {
+    itemId.value = res.itemId
+    predicted.item = true
+  }
+  if (res.processId) processId.value = res.processId
+
+  if (predicted.division || predicted.item) {
+    const parts = [division.value?.name, item.value?.name].filter(Boolean)
+    predictedHint.value = `按近期常用预填：${parts.join(' / ')}`
+    showToast(predictedHint.value)
+  }
+}
+
 function chooseNode(id: string) {
   const level = pickerLevel.value
   pickerLevel.value = ''
@@ -150,17 +197,22 @@ function chooseNode(id: string) {
     divisionId.value = ''
     itemId.value = ''
     processId.value = ''
+    applyPrediction('unit')
     return
   }
   if (level === 'division') {
     divisionId.value = id
     itemId.value = ''
     processId.value = ''
+    predicted.division = false
+    applyPrediction('division')
     return
   }
   if (level === 'item') {
     itemId.value = id
     processId.value = ''
+    predicted.item = false
+    predictedHint.value = ''
     // 这个分项一道工序都没有时，直接把工序表推出来，省得录不进去还不知道为什么
     const siblings = state.processes.filter((p) => p.itemId === id && p.enabled)
     if (!siblings.length) showProcessSheet.value = true
@@ -169,6 +221,7 @@ function chooseNode(id: string) {
 
 function pickProcess(p: Process) {
   processId.value = p.id
+  predictedHint.value = ''
   showProcessSheet.value = false
 }
 
@@ -430,6 +483,9 @@ async function loadFromQuery() {
   itemId.value = ''
   processId.value = ''
   pendingProcessId.value = ''
+  predicted.division = false
+  predicted.item = false
+  predictedHint.value = ''
   date.value = d || todayStr()
   startTime.value = '08:00'
   endTime.value = '12:00'
@@ -506,7 +562,11 @@ onMounted(() => {
         required
         :disabled="!unitId"
         @click="openPicker('division')"
-      />
+      >
+        <template #button>
+          <van-tag v-if="predicted.division" plain type="primary">预判</van-tag>
+        </template>
+      </van-field>
       <van-field
         :model-value="item?.name ?? ''"
         label="分项工程"
@@ -516,7 +576,11 @@ onMounted(() => {
         required
         :disabled="!divisionId"
         @click="openPicker('item')"
-      />
+      >
+        <template #button>
+          <van-tag v-if="predicted.item" plain type="primary">预判</van-tag>
+        </template>
+      </van-field>
       <van-field
         :model-value="selectedProcess?.name ?? ''"
         label="工序"
@@ -527,6 +591,7 @@ onMounted(() => {
         :disabled="!itemId"
         @click="showProcessSheet = true"
       />
+      <div v-if="predictedHint" class="item-note predicted">{{ predictedHint }}，可点开上面任意一栏修改</div>
       <div v-if="item?.note" class="item-note">{{ item.note }}</div>
     </van-cell-group>
 
@@ -748,6 +813,10 @@ onMounted(() => {
   padding: 0 16px 10px;
   font-size: 12px;
   color: #8b95a1;
+}
+
+.item-note.predicted {
+  color: #1f6feb;
 }
 
 .quick-dates {

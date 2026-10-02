@@ -97,6 +97,9 @@ export function shortSpot(itemName: string): string {
     .replace('导流洞1#施工支洞', '1#支洞')
     .replace('导流洞2#施工支洞', '2#支洞')
     .replace('导流洞闸室交通洞', '闸室交通洞')
+    .replace('导流洞主洞', '导流洞洞身')
+    .replace('进厂交通洞主洞', '进厂交通洞')
+    .replace('临时生态放水洞', '放水洞')
 }
 
 export function shortKind(itemName: string): string {
