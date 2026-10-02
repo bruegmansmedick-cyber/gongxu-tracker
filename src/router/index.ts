@@ -9,6 +9,7 @@ const router = createRouter({
     { path: '/dashboard', name: 'dashboard', component: () => import('@/views/DashboardView.vue'), meta: { tab: 'dashboard' } },
     { path: '/manage', name: 'manage', component: () => import('@/views/ManageView.vue'), meta: { tab: 'manage' } },
     { path: '/settings', name: 'settings', component: () => import('@/views/SettingsView.vue'), meta: { tab: 'settings' } },
+    { path: '/security', name: 'security', component: () => import('@/views/SecurityView.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/' }
   ],
   scrollBehavior: () => ({ top: 0 })

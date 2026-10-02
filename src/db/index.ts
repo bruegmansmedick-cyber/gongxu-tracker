@@ -1,7 +1,5 @@
-import Dexie, { type Table } from 'dexie'
 import type {
   CatalogPayload,
-  KvRow,
   Operator,
   Process,
   ProcessRecord,
@@ -15,44 +13,10 @@ import { uid } from '@/core/id'
 import { monthKey, todayStr } from '@/core/time'
 import { BENCH_TEMPLATE, faceOfItem, refHoursOf } from '@/db/seed'
 import { buildHistoryRecords, historyRecordIds } from '@/db/history'
+import { diffOf, logAudit } from '@/db/audit'
+import { db, delKv, getKv, setKv } from '@/db/client'
 
-class AppDB extends Dexie {
-  projects!: Table<Project, string>
-  wbs!: Table<WbsNode, string>
-  processes!: Table<Process, string>
-  records!: Table<ProcessRecord, string>
-  operators!: Table<Operator, string>
-  kv!: Table<KvRow, string>
-
-  constructor() {
-    super('gongxu-tracker')
-    this.version(1).stores({
-      projects: 'id, archived, updatedAt',
-      wbs: 'id, projectId, parentId, [projectId+level], updatedAt',
-      processes: 'id, projectId, itemId, [projectId+itemId], updatedAt',
-      records: 'id, projectId, processId, date, [projectId+date], updatedAt',
-      operators: 'id, updatedAt',
-      kv: 'key'
-    })
-  }
-}
-
-export const db = new AppDB()
-
-// ---------------------------------------------------------------- kv 工具
-
-export async function getKv<T>(key: string, fallback: T): Promise<T> {
-  const row = await db.kv.get(key)
-  return row === undefined ? fallback : (row.value as T)
-}
-
-export async function setKv(key: string, value: unknown): Promise<void> {
-  await db.kv.put({ key, value })
-}
-
-export async function delKv(key: string): Promise<void> {
-  await db.kv.delete(key)
-}
+export { db, delKv, getKv, setKv }
 
 /** 有待同步内容时置位，同步成功后清除 */
 export async function markPending(): Promise<void> {
@@ -117,6 +81,19 @@ export async function saveProject(input: { id?: string; name: string; code?: str
       }
   await db.projects.put(row)
   await markPending()
+  await logAudit({
+    action: existing ? 'update' : 'create',
+    entity: 'project',
+    entityId: row.id,
+    summary: `项目「${row.name}」${existing ? '修改' : '新建'}`,
+    changes: existing
+      ? diffOf(existing as unknown as Record<string, unknown>, row as unknown as Record<string, unknown>, [
+          'name',
+          'code',
+          'archived'
+        ])
+      : undefined
+  })
   return row
 }
 
@@ -147,6 +124,12 @@ export async function deleteProject(id: string): Promise<void> {
   })
   for (const m of months) await markDirtyMonth(m)
   await markPending()
+  await logAudit({
+    action: 'delete',
+    entity: 'project',
+    entityId: id,
+    summary: `删除项目 ${id} 及其全部结构、工序与记录`
+  })
 }
 
 export async function listOperators(): Promise<Operator[]> {
@@ -162,6 +145,12 @@ export async function saveOperator(input: { id?: string; name: string; shift?: s
     : { id: input.id ?? uid('op-'), name: input.name, shift: input.shift ?? '白班', updatedAt: now }
   await db.operators.put(row)
   await markPending()
+  await logAudit({
+    action: existing ? 'update' : 'create',
+    entity: 'operator',
+    entityId: row.id,
+    summary: `记录人「${row.name}（${row.shift}）」${existing ? '修改' : '新增'}`
+  })
   return row
 }
 
@@ -170,6 +159,7 @@ export async function deleteOperator(id: string): Promise<void> {
   if (!row) return
   await db.operators.put({ ...row, deletedAt: Date.now(), updatedAt: Date.now() })
   await markPending()
+  await logAudit({ action: 'delete', entity: 'operator', entityId: id, summary: `删除记录人「${row.name}」` })
 }
 
 // ----------------------------------------------------------------- 工程结构
@@ -225,6 +215,20 @@ export async function saveWbsNode(input: {
       }
   await db.wbs.put(row)
   await markPending()
+  await logAudit({
+    action: existing ? 'update' : 'create',
+    entity: 'wbs',
+    entityId: row.id,
+    summary: `${['', '单位工程', '分部工程', '分项工程'][row.level] ?? '节点'}「${row.name}」${existing ? '修改' : '新增'}`,
+    changes: existing
+      ? diffOf(existing as unknown as Record<string, unknown>, row as unknown as Record<string, unknown>, [
+          'name',
+          'unit',
+          'designQty',
+          'note'
+        ])
+      : undefined
+  })
   return row
 }
 
@@ -264,6 +268,12 @@ export async function deleteWbsNode(id: string, withRecords = true): Promise<voi
   })
   for (const m of months) await markDirtyMonth(m)
   await markPending()
+  await logAudit({
+    action: 'delete',
+    entity: 'wbs',
+    entityId: id,
+    summary: `删除结构「${node.name}」（含下级 ${ids.length - 1} 个节点${withRecords ? '及对应记录' : ''}）`
+  })
 }
 
 export async function saveProcess(input: {
@@ -321,6 +331,21 @@ export async function saveProcess(input: {
       }
   await db.processes.put(row)
   await markPending()
+  await logAudit({
+    action: existing ? 'update' : 'create',
+    entity: 'process',
+    entityId: row.id,
+    summary: `工序「${row.name}」${existing ? '修改' : '新增'}`,
+    changes: existing
+      ? diffOf(existing as unknown as Record<string, unknown>, row as unknown as Record<string, unknown>, [
+          'name',
+          'unit',
+          'designQty',
+          'standardHours',
+          'enabled'
+        ])
+      : undefined
+  })
   return row
 }
 
@@ -343,6 +368,12 @@ export async function deleteProcess(id: string, withRecords = true): Promise<voi
   })
   for (const m of months) await markDirtyMonth(m)
   await markPending()
+  await logAudit({
+    action: 'delete',
+    entity: 'process',
+    entityId: id,
+    summary: `删除工序「${row.name}」${withRecords ? '及其用时记录' : ''}`
+  })
 }
 
 /**
@@ -419,6 +450,16 @@ export async function seedHistoryRecords(projectId: string): Promise<number> {
   })
   for (const m of months) await markDirtyMonth(m)
   await markPending()
+  // 首次补录属于正常的批量写入，给同步闸门放行一次（键名与 src/sync/index.ts 保持一致）
+  await setKv('sync.allowBulkOnce', true)
+  await logAudit({
+    action: 'seed',
+    entity: 'system',
+    entityId: projectId,
+    summary: `补录历史循环作业记录 ${rows.length} 条（2026-09-16 ~ 09-30）`,
+    operatorName: '历史补录',
+    operatorId: 'op-history'
+  })
   return rows.length
 }
 
@@ -440,6 +481,12 @@ export async function clearHistoryRecords(projectId: string): Promise<number> {
   })
   for (const m of months) await markDirtyMonth(m)
   await markPending()
+  await logAudit({
+    action: 'delete',
+    entity: 'system',
+    entityId: projectId,
+    summary: `清除补录的历史记录 ${removed} 条`
+  })
   return removed
 }
 
@@ -510,6 +557,21 @@ export async function saveRecord(input: RecordInput): Promise<ProcessRecord> {
     await markDirtyMonth(monthKey(row.date))
   }
   await markPending()
+  const process = await db.processes.get(row.processId)
+  await logAudit({
+    action: existing ? 'update' : 'create',
+    entity: 'record',
+    entityId: row.id,
+    date: row.date,
+    summary: `${process?.name ?? '未知工序'}｜${row.date} ${row.startTime}-${row.endTime}`,
+    changes: existing
+      ? diffOf(
+          existing as unknown as Record<string, unknown>,
+          row as unknown as Record<string, unknown>,
+          ['date', 'startTime', 'endTime', 'quantity', 'gapReason', 'location', 'note', 'operatorName']
+        )
+      : undefined
+  })
   return row
 }
 
@@ -520,6 +582,14 @@ export async function deleteRecord(id: string): Promise<void> {
   await db.records.put({ ...row, deletedAt: now, updatedAt: now })
   await markDirtyMonth(monthKey(row.date))
   await markPending()
+  const process = await db.processes.get(row.processId)
+  await logAudit({
+    action: 'delete',
+    entity: 'record',
+    entityId: id,
+    date: row.date,
+    summary: `删除记录：${process?.name ?? '未知工序'}｜${row.date} ${row.startTime}-${row.endTime}`
+  })
 }
 
 export async function getRecord(id: string): Promise<ProcessRecord | undefined> {
@@ -615,6 +685,15 @@ export async function importBackup(file: BackupFile, includeSettings = false): P
   const months = new Set((file.records ?? []).map((r) => monthKey(r.date)))
   for (const m of months) await markDirtyMonth(m)
   await markPending()
+  // 导入备份也是正常的批量写入，放行一次
+  await setKv('sync.allowBulkOnce', true)
+  await logAudit({
+    action: 'import',
+    entity: 'system',
+    entityId: 'backup',
+    summary: `导入备份：项目 ${file.catalog?.projects?.length ?? 0} 个、工序 ${file.catalog?.processes?.length ?? 0} 条、记录 ${file.records?.length ?? 0} 条`,
+    changes: undefined
+  })
 }
 
 export async function hasImportSnapshot(): Promise<boolean> {
@@ -627,6 +706,12 @@ export async function restoreImportSnapshot(): Promise<boolean> {
   await writeCatalogPayload(snap.catalog)
   if (snap.records?.length) await db.records.bulkPut(snap.records)
   await markPending()
+  await logAudit({
+    action: 'restore',
+    entity: 'system',
+    entityId: 'backup',
+    summary: '回滚到最近一次导入备份之前的状态'
+  })
   return true
 }
 

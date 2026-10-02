@@ -18,19 +18,24 @@ import {
 } from '@/db'
 import { monthKey } from '@/core/time'
 import { mergeSyncable, normalizeForCompare } from '@/sync/merge'
+import { readAuditPayload, writeAuditPayload, type AuditPayload } from '@/db/audit'
+import { listAudit, logAudit } from '@/db/audit'
 import {
   MAX_FILE_BYTES,
   createGist,
   createGiteeRepo,
   createStore,
+  listGiteeCommits,
   payloadSize,
   runDiagnostics,
+  type CloudCommit,
   type ProbeResult,
   type SyncBackend,
   type SyncConfig
 } from '@/sync/stores'
 
 export type { ProbeResult, SyncBackend, SyncConfig }
+export type { CloudCommit }
 export { MAX_FILE_BYTES, runDiagnostics }
 
 const MAX_ROUNDS = 2
@@ -42,7 +47,18 @@ export interface SyncResult {
   pulledRecords: number
   lastSyncAt: number
   conflict?: boolean
+  /** 本次改动过大，需要管理口令确认后才上传 */
+  needsConfirm?: boolean
+  bulk?: { changed: number; deleted: number }
 }
+
+/** 单次同步允许的改动上限：超过就要管理口令确认 */
+export const BULK_CHANGE_LIMIT = 20
+export const BULK_DELETE_LIMIT = 5
+/** 首次补录历史数据 / 导入备份这类确认为正常的批量操作，放行一次 */
+export const ALLOW_BULK_ONCE_KEY = 'sync.allowBulkOnce'
+export const SECURITY_PIN_KEY = 'security.pin'
+export const DEFAULT_SECURITY_PIN = '070010'
 
 // ------------------------------------------------------------------ 配置
 
@@ -127,12 +143,27 @@ function monthOfFile(name: string): string | null {
   return m ? m[1] : null
 }
 
+function auditMonthOfFile(name: string): string | null {
+  const m = /^audit-(\d{4}-\d{2})\.json$/.exec(name)
+  return m ? m[1] : null
+}
+
+async function localAuditMonths(): Promise<string[]> {
+  const rows = await db.audit.toArray()
+  const set = new Set<string>()
+  rows.forEach((r) => {
+    const d = new Date(r.at)
+    set.add(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`)
+  })
+  return Array.from(set).sort()
+}
+
 async function localMonths(): Promise<string[]> {
   const rows = await db.records.toArray()
   return Array.from(new Set(rows.map((r) => monthKey(r.date)))).sort()
 }
 
-export async function syncNow(): Promise<SyncResult> {
+export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<SyncResult> {
   const cfg = await getSyncConfig()
   if (!isConfigured(cfg)) {
     return {
@@ -160,6 +191,7 @@ export async function syncNow(): Promise<SyncResult> {
   let pushedFiles = 0
   let pulledRecords = 0
   let conflict = false
+  const allowBulkOnce = await getKv<boolean>(ALLOW_BULK_ONCE_KEY, false)
 
   try {
     for (let round = 0; round < MAX_ROUNDS; round += 1) {
@@ -199,6 +231,8 @@ export async function syncNow(): Promise<SyncResult> {
       // 2) 按月分片的记录
       const dirty = await getDirtyMonths()
       const months = Array.from(new Set([...(await localMonths()), ...remoteMonths, ...dirty])).sort()
+      let changedRecords = 0
+      let deletedRecords = 0
       for (const month of months) {
         const remotePayload = parseJson<RecordsPayload>(remoteFiles[`records-${month}.json`])
         const localPayload = await readRecordsPayload(month)
@@ -209,6 +243,19 @@ export async function syncNow(): Promise<SyncResult> {
           await writeRecordsPayload({ month, updatedAt: Date.now(), records: merged.rows })
         }
         const needsPush = merged.remoteDiffers || dirty.includes(month)
+        if (needsPush) {
+          const remoteById = new Map((remotePayload?.records ?? []).map((r) => [r.id, r]))
+          merged.rows.forEach((row) => {
+            const remote = remoteById.get(row.id)
+            if (!remote) {
+              if (!row.deletedAt) changedRecords += 1
+              return
+            }
+            if (JSON.stringify(row) === JSON.stringify(remote)) return
+            if (row.deletedAt && !remote.deletedAt) deletedRecords += 1
+            else changedRecords += 1
+          })
+        }
         const payload: RecordsPayload = {
           month,
           updatedAt: Math.max(Date.now(), remotePayload?.updatedAt ?? 0),
@@ -225,13 +272,85 @@ export async function syncNow(): Promise<SyncResult> {
         }
       }
 
-      // 3) 推送
+      // 3) 操作留痕：只追加、按 id 求并集，任何设备都无法用 App 抹掉历史
+      const auditMonths = Array.from(
+        new Set([
+          ...(await localAuditMonths()),
+          ...Object.keys(remoteFiles)
+            .map(auditMonthOfFile)
+            .filter((m): m is string => !!m)
+        ])
+      ).sort()
+      for (const month of auditMonths) {
+        const remotePayload = parseJson<AuditPayload>(remoteFiles[`audit-${month}.json`])
+        const localPayload = await readAuditPayload(month)
+        const localIds = new Set(localPayload.entries.map((e) => e.id))
+        const missing = (remotePayload?.entries ?? []).filter((e) => !localIds.has(e.id))
+        if (missing.length) {
+          await writeAuditPayload({ month, updatedAt: Date.now(), entries: missing })
+        }
+        const remoteIds = new Set((remotePayload?.entries ?? []).map((e) => e.id))
+        const toPush = localPayload.entries.filter((e) => !remoteIds.has(e.id))
+        if (toPush.length) {
+          const merged = [...(remotePayload?.entries ?? []), ...toPush]
+            .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
+          const payload: AuditPayload = { month, updatedAt: Date.now(), entries: merged }
+          const size = payloadSize(payload)
+          if (size > MAX_FILE_BYTES) {
+            throw new Error(`留痕文件 ${month} 已达 ${(size / 1024).toFixed(0)}KB，接近上限，请归档较早的留痕`)
+          }
+          filesToPush[`audit-${month}.json`] = JSON.stringify(payload)
+        }
+      }
+
+      // 4) 推送
+      const bulkLike = changedRecords + deletedRecords > BULK_CHANGE_LIMIT || deletedRecords > BULK_DELETE_LIMIT
+      if (bulkLike && !opts.confirmBulk && !allowBulkOnce) {
+        const summary = `本次同步包含 修改 ${changedRecords} 条、删除 ${deletedRecords} 条，已暂缓上传，等待管理口令确认`
+        // 同一批改动每次自动同步都会再试一次，避免把告警页刷屏：10 分钟内同内容只记一条
+        const recent = await listAudit({ limit: 10 })
+        const lastBlocked = recent.find((a) => a.action === 'bulk-blocked')
+        if (!lastBlocked || lastBlocked.summary !== summary || Date.now() - lastBlocked.at > 10 * 60 * 1000) {
+          await logAudit({
+            action: 'bulk-blocked',
+            entity: 'system',
+            entityId: 'sync',
+            summary,
+            changes: [
+              { field: '修改', from: '—', to: String(changedRecords) },
+              { field: '删除', from: '—', to: String(deletedRecords) }
+            ]
+          })
+        }
+        return {
+          ok: false,
+          message: `本次改动较大（修改 ${changedRecords} 条、删除 ${deletedRecords} 条），已暂缓上传。请输入管理口令确认后再同步。`,
+          pushedFiles: 0,
+          pulledRecords: Math.max(0, pulledRecords),
+          lastSyncAt: 0,
+          needsConfirm: true,
+          bulk: { changed: changedRecords, deleted: deletedRecords }
+        }
+      }
+      if (bulkLike && (opts.confirmBulk || allowBulkOnce)) {
+        await logAudit({
+          action: 'bulk-approved',
+          entity: 'system',
+          entityId: 'sync',
+          summary: `${opts.confirmBulk ? '管理口令确认' : '首次补录/导入白名单'}后上传：修改 ${changedRecords} 条、删除 ${deletedRecords} 条`,
+          changes: [
+            { field: '修改', from: '—', to: String(changedRecords) },
+            { field: '删除', from: '—', to: String(deletedRecords) }
+          ]
+        })
+      }
       if (Object.keys(filesToPush).length) {
         await store.writeFiles(filesToPush)
         pushedFiles += Object.keys(filesToPush).length
+        if (allowBulkOnce) await setKv(ALLOW_BULK_ONCE_KEY, false)
       }
 
-      // 4) 回拉校验：确认推上去的内容没有被别的设备覆盖
+      // 5) 回拉校验：确认推上去的内容没有被别的设备覆盖
       const verify = await store.readAll()
       const overwritten = Object.entries(filesToPush).some(([name, content]) => verify[name] !== content)
       if (!overwritten) {
@@ -278,4 +397,31 @@ export async function syncState(): Promise<{
     lastSyncAt: await getKv<number>('sync.lastSyncAt', 0),
     pending: await isPending()
   }
+}
+
+/** 管理口令：默认 070010，存在本机（不参与同步），用于放行大批量改动 */
+export async function checkSecurityPin(pin: string): Promise<boolean> {
+  const saved = await getKv<string>(SECURITY_PIN_KEY, DEFAULT_SECURITY_PIN)
+  return pin.trim() === saved
+}
+
+export async function saveSecurityPin(pin: string): Promise<void> {
+  await setKv(SECURITY_PIN_KEY, pin.trim())
+}
+
+export async function currentSecurityPin(): Promise<string> {
+  return getKv<string>(SECURITY_PIN_KEY, DEFAULT_SECURITY_PIN)
+}
+
+/** 允许一次大批量写入（导入、补录等），用于测试与人工放行 */
+export async function allowBulkOnce(): Promise<void> {
+  await setKv(ALLOW_BULK_ONCE_KEY, true)
+}
+
+/** 看云端数据文件的版本历史（只读，用于追溯；回滚由维护者在云端执行） */
+export async function listDataCommits(limit = 20): Promise<CloudCommit[]> {
+  const cfg = await getSyncConfig()
+  if (cfg.backend !== 'gitee') throw new Error('版本历史目前只支持 Gitee 数据仓库')
+  if (!cfg.giteeRepo || !cfg.giteeToken) throw new Error('尚未配置 Gitee 数据仓库')
+  return listGiteeCommits(cfg.giteeToken.trim(), cfg.giteeRepo.trim(), cfg.giteeDir.trim() || 'data', limit)
 }

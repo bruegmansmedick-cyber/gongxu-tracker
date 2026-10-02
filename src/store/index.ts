@@ -22,6 +22,9 @@ export interface SyncViewState {
   syncing: boolean
   message: string
   error: boolean
+  /** 本次改动过大，等待管理口令确认 */
+  needsConfirm: boolean
+  bulk: { changed: number; deleted: number } | null
 }
 
 interface AppState {
@@ -56,7 +59,9 @@ export const state = reactive<AppState>({
     pending: false,
     syncing: false,
     message: '',
-    error: false
+    error: false,
+    needsConfirm: false,
+    bulk: null
   },
   scope: { ...ALL_SCOPE } as AnalysisScope
 })
@@ -161,6 +166,8 @@ export function scopeText(): string {
 export async function setOperator(id: string): Promise<void> {
   state.currentOperatorId = id
   await setKv('ui.currentOperatorId', id)
+  // 留痕需要记录人名，这里一并持久化
+  await setKv('ui.currentOperatorName', state.operators.find((o) => o.id === id)?.name ?? '')
 }
 
 export async function refreshSyncState(): Promise<void> {
@@ -206,7 +213,7 @@ export function scheduleSync(delay = 4000): void {
   }, delay)
 }
 
-export async function runSync(manual: boolean): Promise<boolean> {
+export async function runSync(manual: boolean, opts: { confirmBulk?: boolean } = {}): Promise<boolean> {
   if (state.sync.syncing) return false
   const cfg = await readSyncState()
   if (!cfg.configured) {
@@ -222,9 +229,11 @@ export async function runSync(manual: boolean): Promise<boolean> {
   state.sync.message = '正在同步…'
   state.sync.error = false
   try {
-    const result = await syncNow()
+    const result = await syncNow(opts)
     state.sync.message = result.message
     state.sync.error = !result.ok
+    state.sync.needsConfirm = Boolean(result.needsConfirm)
+    state.sync.bulk = result.bulk ?? null
     await refreshAll()
     return result.ok
   } catch (err) {

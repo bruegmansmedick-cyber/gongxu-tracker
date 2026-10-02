@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { afterChange, state } from '@/store'
 import { deleteRecord as removeRecord, getRecord, saveRecord } from '@/db'
 import { buildTimeFields, suggestStandardHours } from '@/core/compute'
+import { checkBeforeSave } from '@/core/health'
 import { GAP_REASONS } from '@/core/reasons'
-import { fmtDate, fmtHours, nowHhmm, todayStr } from '@/core/time'
+import { addDays, fmtDate, fmtHours, friendlyDate, nowHhmm, todayStr } from '@/core/time'
 
 const route = useRoute()
 const router = useRouter()
@@ -115,6 +116,19 @@ function onCalendarConfirm(value: Date) {
   showCalendar.value = false
 }
 
+/** 补填常用日期：默认日历只能选今天及以后，这里给两个快捷入口 */
+const quickDates = computed(() => [todayStr(), addDays(todayStr(), -1), addDays(todayStr(), -2)])
+
+function quickLabel(value: string): string {
+  if (value === todayStr()) return '今天'
+  if (value === addDays(todayStr(), -1)) return '昨天'
+  return '前天'
+}
+
+function setQuickDate(value: string) {
+  date.value = value
+}
+
 function onStartConfirm() {
   startTime.value = startPickerValue.value.map((v) => String(v).padStart(2, '0')).join(':')
   showStartPicker.value = false
@@ -156,6 +170,25 @@ async function save() {
   saving.value = true
   try {
     const op = state.operators.find((o) => o.id === state.currentOperatorId)
+    // 保存前做一次衔接体检：重叠 / 间隔过长 / 重复录入 → 先让人确认
+    const times = buildTimeFields(date.value, startTime.value, endTime.value)
+    const warnings = checkBeforeSave(
+      { id: recordId.value ?? undefined, processId: processId.value, date: date.value, startAt: times.startAt, endAt: times.endAt },
+      state.records,
+      processById.value
+    )
+    if (warnings.length) {
+      try {
+        await showConfirmDialog({
+          title: '这条记录有点异常，请确认',
+          message: `${warnings.join('\n')}\n\n确认无误可选“仍然保存”，异常会记入留痕。`,
+          confirmButtonText: '仍然保存',
+          cancelButtonText: '返回修改'
+        })
+      } catch {
+        return
+      }
+    }
     await saveRecord({
       id: recordId.value ?? undefined,
       projectId: state.currentProjectId,
@@ -171,8 +204,17 @@ async function save() {
       operatorName: op?.name ?? '未署名'
     })
     await afterChange('records')
-    showToast(recordId.value ? '已保存修改' : '记录已保存')
-    router.replace('/')
+    const isToday = date.value === todayStr()
+    if (recordId.value) {
+      showToast('已保存修改')
+    } else if (isToday) {
+      showToast('记录已保存')
+    } else {
+      showToast(`已保存 ${friendlyDate(date.value)} 的记录（不在“今日”列表里）`)
+    }
+    // 补填历史日期时直接跳到那个月的明细，免得以为没存上
+    if (!isToday) router.replace({ path: '/records', query: { month: date.value.slice(0, 7) } })
+    else router.replace('/')
   } catch (err) {
     showToast(err instanceof Error ? err.message : '保存失败')
   } finally {
@@ -189,12 +231,23 @@ async function remove() {
   router.replace('/records')
 }
 
-onMounted(async () => {
+/** 按地址栏参数初始化表单；query 变化时也重跑，避免路由复用组件时串数据 */
+async function loadFromQuery() {
   const q = route.query
   const id = typeof q.id === 'string' ? q.id : ''
   const pid = typeof q.processId === 'string' ? q.processId : ''
   const d = typeof q.date === 'string' ? q.date : ''
-  if (d) date.value = d
+  recordId.value = null
+  processId.value = ''
+  cascaderValue.value = ''
+  processPath.value = ''
+  date.value = d || todayStr()
+  startTime.value = '08:00'
+  endTime.value = '12:00'
+  quantity.value = ''
+  gapReason.value = 'none'
+  location.value = ''
+  note.value = ''
   if (pid) {
     processId.value = pid
     cascaderValue.value = pid
@@ -218,14 +271,19 @@ onMounted(async () => {
       note.value = row.note ?? ''
     }
   }
-  if (id && recordId.value && (!endTime.value || endTime.value === '12:00')) {
-    endTime.value = nowHhmm()
-    endPickerValue.value = endTime.value.split(':')
+  startPickerValue.value = startTime.value.split(':')
+  endPickerValue.value = endTime.value.split(':')
+}
+
+watch(
+  () => route.query,
+  () => {
+    void loadFromQuery()
   }
-  if (!id && !pid) {
-    startPickerValue.value = startTime.value.split(':')
-    endPickerValue.value = endTime.value.split(':')
-  }
+)
+
+onMounted(() => {
+  void loadFromQuery()
 })
 </script>
 
@@ -244,6 +302,23 @@ onMounted(async () => {
         @click="showCascader = true"
       />
       <van-field :model-value="date" label="施工日期" readonly is-link required @click="showCalendar = true" />
+      <van-field label="快捷补填">
+        <template #input>
+          <div class="quick-dates">
+            <button
+              v-for="d in quickDates"
+              :key="d"
+              type="button"
+              class="quick-date"
+              :class="{ active: date === d }"
+              @click="setQuickDate(d)"
+            >
+              {{ quickLabel(d) }}
+            </button>
+            <span class="muted">或用上面的日期自由选</span>
+          </div>
+        </template>
+      </van-field>
       <van-field :model-value="startTime" label="开工时刻" readonly is-link required @click="showStartPicker = true">
         <template #button>
           <van-button size="mini" plain type="primary" @click.stop="fillNowStart">现在</van-button>
@@ -313,7 +388,14 @@ onMounted(async () => {
     />
   </van-popup>
 
-  <van-calendar v-model:show="showCalendar" :default-date="new Date(date)" @confirm="onCalendarConfirm" />
+  <van-calendar
+    v-model:show="showCalendar"
+    :default-date="new Date(date)"
+    :min-date="new Date(2024, 0, 1)"
+    :max-date="new Date(Date.now() + 31 * 86400000)"
+    switch-mode="year-month"
+    @confirm="onCalendarConfirm"
+  />
 
   <van-popup v-model:show="showStartPicker" round position="bottom">
     <van-time-picker v-model="startPickerValue" title="开工时刻" @confirm="onStartConfirm" @cancel="showStartPicker = false" />
@@ -338,5 +420,27 @@ onMounted(async () => {
   margin: 10px 16px 0;
   font-size: 12px;
   color: #8b95a1;
+}
+
+.quick-dates {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.quick-date {
+  border: 1px solid #dfe4ea;
+  background: #f8f9fb;
+  border-radius: 999px;
+  padding: 4px 12px;
+  font-size: 12px;
+  color: #33404f;
+}
+
+.quick-date.active {
+  border-color: #1f6feb;
+  background: #eef3ff;
+  color: #1f6feb;
 }
 </style>

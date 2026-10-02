@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, reactive, ref } from 'vue'
+import { useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { afterChange, refreshSyncState, runSync, setOperator, state } from '@/store'
 import {
@@ -16,6 +17,7 @@ import {
 } from '@/db'
 import {
   clearSyncConfig,
+  checkSecurityPin,
   createDataSpace,
   getSyncConfig,
   isConfigured,
@@ -25,6 +27,7 @@ import {
   type SyncConfig
 } from '@/sync'
 import { createStore } from '@/sync/stores'
+import { listAudit } from '@/db/audit'
 import { exportProjectExcel } from '@/utils/exportExcel'
 import { downloadText, pickFile, readFileText, stamp } from '@/utils/download'
 import { endOfMonth, fmtDate, fmtHoursShort, monthKey, startOfMonth, todayStr } from '@/core/time'
@@ -40,10 +43,13 @@ const syncCfg = reactive<SyncConfig>({
 })
 const probes = ref<ProbeResult[]>([])
 const probing = ref(false)
+const pinDraft = reactive({ show: false, value: '', error: '' })
 const snapshotAvailable = ref(false)
 const exportRange = reactive({ from: startOfMonth(todayStr()), to: endOfMonth(todayStr()) })
 
 const showPat = ref(false)
+const router = useRouter()
+const alertCount = ref(0)
 const showFromCalendar = ref(false)
 const showToCalendar = ref(false)
 const showOperatorEditor = ref(false)
@@ -58,12 +64,23 @@ onMounted(async () => {
   const cfg = await getSyncConfig()
   Object.assign(syncCfg, cfg)
   snapshotAvailable.value = await hasImportSnapshot()
+  alertCount.value = (await listAudit({ alertsOnly: true, limit: 200 })).length
 })
 
 async function persistSync() {
   await saveSyncConfig({ ...syncCfg })
   await setKv('sync.pending', true)
   await refreshSyncState()
+  // 配置填好后自动同步一次，不用再手动点"立即同步"
+  if (isConfigured({ ...syncCfg })) scheduleAutoSync()
+}
+
+let autoSyncTimer: number | undefined
+function scheduleAutoSync(delay = 3000) {
+  if (autoSyncTimer) window.clearTimeout(autoSyncTimer)
+  autoSyncTimer = window.setTimeout(() => {
+    void runSync(false)
+  }, delay)
 }
 
 async function doCreateSpace() {
@@ -132,9 +149,25 @@ async function doSync() {
     }
     const ok = await runSync(true)
     showToast(state.sync.message || (ok ? '同步完成' : '同步失败'))
+    if (state.sync.needsConfirm) {
+      pinDraft.value = ''
+      pinDraft.error = ''
+      pinDraft.show = true
+    }
   } finally {
     busy.value = ''
   }
+}
+
+/** 大批量改动需要管理口令放行 */
+async function confirmBulkPin() {
+  if (!(await checkSecurityPin(pinDraft.value))) {
+    pinDraft.error = '口令不对'
+    return
+  }
+  pinDraft.show = false
+  await runSync(true, { confirmBulk: true })
+  showToast(state.sync.message || '已确认并上传')
 }
 
 async function doClearSync() {
@@ -283,6 +316,19 @@ function quickAll() {
       <van-button size="small" plain type="primary" @click="openOperatorEditor()">添加记录人</van-button>
     </div>
 
+    <div class="card safety-card" @click="router.push('/security')">
+      <div class="card-title">
+        数据安全
+        <span class="sub">
+          <template v-if="alertCount">有 {{ alertCount }} 条告警</template>
+          <template v-else>留痕 / 体检 / 版本历史</template>
+        </span>
+      </div>
+      <div class="muted">
+        操作留痕、自动体检、大批量改动需口令确认、云端版本历史 —— 点这里查看 <van-icon name="arrow" />
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-title">
         数据同步
@@ -345,6 +391,15 @@ function quickAll() {
       </div>
       <div class="divider" />
       <div class="muted">上次同步：{{ lastSyncText }}</div>
+      <div v-if="state.sync.needsConfirm" class="bulk-warn">
+        <div>
+          本次改动较大：修改 {{ state.sync.bulk?.changed ?? 0 }} 条、删除
+          {{ state.sync.bulk?.deleted ?? 0 }} 条，已暂缓上传。
+        </div>
+        <van-button size="small" type="danger" style="margin-top: 8px" @click="pinDraft.show = true">
+          输入管理口令并上传
+        </van-button>
+      </div>
       <div v-if="state.sync.message" class="muted" :style="{ color: state.sync.error ? '#d14343' : '#12805c' }">
         {{ state.sync.message }}
       </div>
@@ -444,6 +499,27 @@ function quickAll() {
       </div>
     </div>
   </van-popup>
+
+  <van-popup v-model:show="pinDraft.show" round position="bottom">
+    <div style="padding: 16px">
+      <div class="card-title">需要管理口令确认</div>
+      <div class="muted" style="margin-bottom: 10px">
+        这次同步包含修改 {{ state.sync.bulk?.changed ?? 0 }} 条、删除 {{ state.sync.bulk?.deleted ?? 0 }} 条，
+        超过日常改动范围，确认是你本人操作再输入口令上传。
+      </div>
+      <van-field
+        v-model="pinDraft.value"
+        type="password"
+        label="管理口令"
+        placeholder="请输入 6 位口令"
+        :error-message="pinDraft.error"
+      />
+      <div style="display: flex; gap: 10px; margin-top: 16px">
+        <van-button block plain @click="pinDraft.show = false">取消</van-button>
+        <van-button block type="danger" @click="confirmBulkPin">确认上传</van-button>
+      </div>
+    </div>
+  </van-popup>
 </template>
 
 <style scoped>
@@ -465,5 +541,18 @@ function quickAll() {
   flex-wrap: wrap;
   gap: 8px;
   margin-top: 10px;
+}
+
+.bulk-warn {
+  margin-top: 8px;
+  padding: 10px;
+  border-radius: 8px;
+  background: #fdecec;
+  color: #d14343;
+  font-size: 13px;
+}
+
+.safety-card {
+  cursor: pointer;
 }
 </style>

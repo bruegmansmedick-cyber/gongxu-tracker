@@ -316,6 +316,36 @@ export interface ProbeResult {
   detail: string
 }
 
+export interface CloudCommit {
+  sha: string
+  date: string
+  message: string
+}
+
+/** 读取 Gitee 版本历史（每个数据文件都是一次提交，可用于追溯与回滚） */
+export async function listGiteeCommits(
+  token: string,
+  repo: string,
+  path = 'data',
+  limit = 20
+): Promise<CloudCommit[]> {
+  const params = new URLSearchParams({ access_token: token, per_page: String(limit) })
+  if (path) params.set('path', path)
+  const res = await fetchWithTimeout(`${GITEE_API}/repos/${repo}/commits?${params.toString()}`, {
+    headers: { Accept: 'application/json' }
+  })
+  if (!res.ok) throw new Error(await readError(res, '读取版本历史'))
+  const list = (await res.json()) as Array<{
+    sha?: string
+    commit?: { message?: string; committer?: { date?: string } }
+  }>
+  return list.map((c) => ({
+    sha: c.sha ?? '',
+    date: c.commit?.committer?.date ?? '',
+    message: (c.commit?.message ?? '').split('\n')[0]
+  }))
+}
+
 /** 网络诊断：分别测两个同步接口在当前网络下的连通性与耗时 */
 export async function runDiagnostics(): Promise<ProbeResult[]> {
   const targets: Array<{ name: string; url: string }> = [
