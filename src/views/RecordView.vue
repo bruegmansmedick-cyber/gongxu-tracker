@@ -1,20 +1,26 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { afterChange, state } from '@/store'
-import { deleteRecord as removeRecord, getRecord, saveRecord } from '@/db'
+import { deleteRecord as removeRecord, getKv, getRecord, saveProcess, saveRecord, setKv } from '@/db'
 import { buildTimeFields, suggestStandardHours } from '@/core/compute'
 import { checkBeforeSave } from '@/core/health'
 import { GAP_REASONS } from '@/core/reasons'
+import { recommendProcesses, rememberProcess, type ProcessMemory } from '@/core/recommend'
 import { addDays, fmtDate, fmtHours, friendlyDate, nowHhmm, todayStr } from '@/core/time'
+import type { Process, WbsLevel, WbsNode } from '@/types'
 
 const route = useRoute()
 const router = useRouter()
 
 const recordId = ref<string | null>(null)
+/** 四级选择：单位工程 → 分部工程 → 分项工程 → 工序 */
+const unitId = ref('')
+const divisionId = ref('')
+const itemId = ref('')
 const processId = ref('')
-const processPath = ref('')
+
 const date = ref(todayStr())
 const startTime = ref('08:00')
 const endTime = ref('12:00')
@@ -24,53 +30,93 @@ const location = ref('')
 const note = ref('')
 const saving = ref(false)
 
-const showCascader = ref(false)
 const showCalendar = ref(false)
 const showStartPicker = ref(false)
 const showEndPicker = ref(false)
 const showReasonPicker = ref(false)
+const showProcessSheet = ref(false)
 
-const cascaderValue = ref<string | number>('')
+/** 结构选择弹层：unit / division / item 三选一，空串表示关闭 */
+const pickerLevel = ref<'' | 'unit' | 'division' | 'item'>('')
+const search = ref('')
+const showPicker = computed({
+  get: () => pickerLevel.value !== '',
+  set: (v: boolean) => {
+    if (!v) pickerLevel.value = ''
+  }
+})
+
+const processEditor = reactive({
+  show: false,
+  id: '',
+  name: '',
+  unit: ''
+})
+const savingProcess = ref(false)
+
+/**
+ * 手工新增工序的记忆（本机保存，不参与云同步）。
+ * 用 shallowRef 是有意的：IndexedDB 存不了 Vue 的响应式代理（会报 DataCloneError），
+ * 所以这里始终保持普通对象。
+ */
+const memory = shallowRef<ProcessMemory>({})
+
 const startPickerValue = ref<string[]>(startTime.value.split(':'))
 const endPickerValue = ref<string[]>(endTime.value.split(':'))
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
-const selectedProcess = computed(() => processById.value.get(processId.value))
 
-interface CascaderOption {
-  text: string
-  value: string
-  children?: CascaderOption[]
+function childrenOf(parentId: string | null, level: WbsLevel): WbsNode[] {
+  return state.wbs
+    .filter((w) => w.parentId === parentId && w.level === level)
+    .sort((a, b) => a.sort - b.sort)
 }
 
-const cascaderOptions = computed<CascaderOption[]>(() => {
-  const nodes = state.wbs
-  const units = nodes.filter((n) => n.level === 1).sort((a, b) => a.sort - b.sort)
-  return units.map((unit) => ({
-    text: unit.name,
-    value: unit.id,
-    children: nodes
-      .filter((n) => n.parentId === unit.id)
-      .sort((a, b) => a.sort - b.sort)
-      .map((div) => ({
-        text: div.name,
-        value: div.id,
-        children: nodes
-          .filter((n) => n.parentId === div.id)
-          .sort((a, b) => a.sort - b.sort)
-          .map((item) => ({
-            text: item.name,
-            value: item.id,
-            children: state.processes
-              .filter((p) => p.itemId === item.id && p.enabled)
-              .sort((a, b) => a.sort - b.sort)
-              .map((p) => ({ text: p.name, value: p.id }))
-          }))
-          .filter((item) => (item.children?.length ?? 0) > 0)
-      }))
-      .filter((div) => (div.children?.length ?? 0) > 0)
-  }))
+const units = computed(() => childrenOf(null, 1))
+const divisions = computed(() => (unitId.value ? childrenOf(unitId.value, 2) : []))
+const items = computed(() => (divisionId.value ? childrenOf(divisionId.value, 3) : []))
+
+const unit = computed(() => wbsById.value.get(unitId.value))
+const division = computed(() => wbsById.value.get(divisionId.value))
+const item = computed(() => wbsById.value.get(itemId.value))
+const selectedProcess = computed(() => processById.value.get(processId.value))
+
+/** 该分项下已有的工序（工程管理里建的、别的设备同步过来的都算） */
+const itemProcesses = computed(() =>
+  state.processes.filter((p) => p.itemId === itemId.value && p.enabled).sort((a, b) => a.sort - b.sort)
+)
+
+/** 推荐 = 本分项已有 + 同类分项用过（记忆）+ 按项目划分匹配的通用工序 */
+const recommendation = computed(() =>
+  recommendProcesses({
+    itemName: item.value?.name ?? '',
+    note: item.value?.note,
+    existing: itemProcesses.value.map((p) => p.name),
+    memory: memory.value
+  })
+)
+
+const pickerTitle = computed(() => {
+  if (pickerLevel.value === 'unit') return '选择单位工程'
+  if (pickerLevel.value === 'division') return '选择分部工程'
+  if (pickerLevel.value === 'item') return '选择分项工程'
+  return ''
+})
+
+const pickerOptions = computed<WbsNode[]>(() => {
+  if (pickerLevel.value === 'unit') return units.value
+  if (pickerLevel.value === 'division') return divisions.value
+  if (pickerLevel.value !== 'item') return []
+  const kw = search.value.trim()
+  if (!kw) return items.value
+  return items.value.filter((i) => i.name.includes(kw) || (i.note ?? '').includes(kw))
+})
+
+const currentPickId = computed(() => {
+  if (pickerLevel.value === 'unit') return unitId.value
+  if (pickerLevel.value === 'division') return divisionId.value
+  return itemId.value
 })
 
 const hours = computed(() => buildTimeFields(date.value, startTime.value, endTime.value).hours)
@@ -90,24 +136,135 @@ const historyHint = computed(() => {
   return `历史平均 ${fmtHours(s.value)}（${s.sample} 条记录）`
 })
 
-function pathOf(pid: string): string {
-  const p = processById.value.get(pid)
-  if (!p) return ''
-  const item = wbsById.value.get(p.itemId)
-  const div = item?.parentId ? wbsById.value.get(item.parentId) : undefined
-  const unit = div?.parentId ? wbsById.value.get(div.parentId) : undefined
-  return [unit?.name, div?.name, item?.name, p.name].filter(Boolean).join(' / ')
+function openPicker(level: 'unit' | 'division' | 'item') {
+  search.value = ''
+  pickerLevel.value = level
 }
 
-function onCascaderFinish(payload: { selectedOptions: Array<{ value: string | number }> }) {
-  const last = payload.selectedOptions[payload.selectedOptions.length - 1]
-  processId.value = String(last?.value ?? '')
-  cascaderValue.value = processId.value
-  processPath.value = pathOf(processId.value)
-  showCascader.value = false
-  if (!location.value) {
-    const item = selectedProcess.value ? wbsById.value.get(selectedProcess.value.itemId) : undefined
-    if (item?.name) location.value = ''
+function chooseNode(id: string) {
+  const level = pickerLevel.value
+  pickerLevel.value = ''
+  search.value = ''
+  if (level === 'unit') {
+    unitId.value = id
+    divisionId.value = ''
+    itemId.value = ''
+    processId.value = ''
+    return
+  }
+  if (level === 'division') {
+    divisionId.value = id
+    itemId.value = ''
+    processId.value = ''
+    return
+  }
+  if (level === 'item') {
+    itemId.value = id
+    processId.value = ''
+    // 这个分项一道工序都没有时，直接把工序表推出来，省得录不进去还不知道为什么
+    const siblings = state.processes.filter((p) => p.itemId === id && p.enabled)
+    if (!siblings.length) showProcessSheet.value = true
+  }
+}
+
+function pickProcess(p: Process) {
+  processId.value = p.id
+  showProcessSheet.value = false
+}
+
+async function rememberThisItem(name: string) {
+  const target = item.value
+  if (!target) return
+  // 新对象、普通字段：既触发更新，又能安全写进 IndexedDB
+  const next = rememberProcess(memory.value, target.name, name, target.note)
+  memory.value = next
+  await setKv('ui.processMemory', next)
+}
+
+/** 新增一道工序到当前分项，并自动选中 */
+async function createProcess(name: string, unitText?: string): Promise<Process | null> {
+  const target = item.value
+  if (!state.currentProjectId || !target) {
+    showToast('请先选到分项工程')
+    return null
+  }
+  const row = await saveProcess({
+    projectId: state.currentProjectId,
+    itemId: target.id,
+    name,
+    unit: unitText?.trim() || target.unit
+  })
+  await rememberThisItem(name)
+  await afterChange('structure')
+  processId.value = row.id
+  return row
+}
+
+/** 点推荐里的工序：直接建到本分项并选中（推荐只是推荐，落了库才是真工序） */
+async function pickRecommended(name: string) {
+  savingProcess.value = true
+  try {
+    await createProcess(name)
+    showProcessSheet.value = false
+    showToast(`已新增工序「${name}」`)
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : '新增工序失败')
+  } finally {
+    savingProcess.value = false
+  }
+}
+
+function openNewProcess() {
+  processEditor.id = ''
+  processEditor.name = ''
+  processEditor.unit = item.value?.unit ?? ''
+  processEditor.show = true
+}
+
+function openRenameProcess(p: Process) {
+  processEditor.id = p.id
+  processEditor.name = p.name
+  processEditor.unit = p.unit ?? ''
+  processEditor.show = true
+}
+
+async function submitProcess() {
+  const name = processEditor.name.trim()
+  if (!name) {
+    showToast('请填工序名称')
+    return
+  }
+  const editing = processEditor.id
+  savingProcess.value = true
+  try {
+    if (editing) {
+      const old = processById.value.get(editing)
+      if (!old) {
+        showToast('这道工序已不存在')
+        return
+      }
+      await saveProcess({
+        id: editing,
+        projectId: old.projectId,
+        itemId: old.itemId,
+        name,
+        unit: processEditor.unit.trim() || undefined,
+        designQty: old.designQty,
+        standardHours: old.standardHours,
+        enabled: old.enabled
+      })
+      await afterChange('structure')
+      showToast('工序名称已修改')
+    } else {
+      await createProcess(name, processEditor.unit)
+      showProcessSheet.value = false
+      showToast(`已新增工序「${name}」`)
+    }
+    processEditor.show = false
+  } catch (err) {
+    showToast(err instanceof Error ? err.message : '保存工序失败')
+  } finally {
+    savingProcess.value = false
   }
 }
 
@@ -116,7 +273,7 @@ function onCalendarConfirm(value: Date) {
   showCalendar.value = false
 }
 
-/** 补填常用日期：默认日历只能选今天及以后，这里给两个快捷入口 */
+/** 补填常用日期：默认日历只能选今天及以后，这里给三个快捷入口 */
 const quickDates = computed(() => [todayStr(), addDays(todayStr(), -1), addDays(todayStr(), -2)])
 
 function quickLabel(value: string): string {
@@ -156,7 +313,8 @@ function fillNowEnd() {
 
 async function save() {
   if (!processId.value) {
-    showToast('请先选择工序')
+    if (itemId.value) showProcessSheet.value = true
+    else showToast('请先选择工序')
     return
   }
   if (!state.currentProjectId) {
@@ -231,16 +389,47 @@ async function remove() {
   router.replace('/records')
 }
 
+/** 由工序反推它所属的单位 / 分部 / 分项（编辑记录、从别处带参数进来时用） */
+function applyProcess(pid: string): boolean {
+  const p = processById.value.get(pid)
+  if (!p) return false
+  processId.value = p.id
+  itemId.value = p.itemId
+  const target = wbsById.value.get(p.itemId)
+  divisionId.value = target?.parentId ?? ''
+  const div = divisionId.value ? wbsById.value.get(divisionId.value) : undefined
+  unitId.value = div?.parentId ?? ''
+  return true
+}
+
+/** 结构还没加载完时先把要选的工序记下来，加载完再补上 */
+const pendingProcessId = ref('')
+
+function applyPending() {
+  if (!pendingProcessId.value) return
+  if (applyProcess(pendingProcessId.value)) pendingProcessId.value = ''
+}
+
+watch([() => state.ready, () => state.wbs.length], applyPending)
+
+async function loadMemory() {
+  memory.value = await getKv<ProcessMemory>('ui.processMemory', {})
+}
+
 /** 按地址栏参数初始化表单；query 变化时也重跑，避免路由复用组件时串数据 */
 async function loadFromQuery() {
   const q = route.query
   const id = typeof q.id === 'string' ? q.id : ''
   const pid = typeof q.processId === 'string' ? q.processId : ''
+  const wantedItem = typeof q.itemId === 'string' ? q.itemId : ''
   const d = typeof q.date === 'string' ? q.date : ''
+
   recordId.value = null
+  unitId.value = ''
+  divisionId.value = ''
+  itemId.value = ''
   processId.value = ''
-  cascaderValue.value = ''
-  processPath.value = ''
+  pendingProcessId.value = ''
   date.value = d || todayStr()
   startTime.value = '08:00'
   endTime.value = '12:00'
@@ -248,18 +437,24 @@ async function loadFromQuery() {
   gapReason.value = 'none'
   location.value = ''
   note.value = ''
+
   if (pid) {
-    processId.value = pid
-    cascaderValue.value = pid
-    processPath.value = pathOf(pid)
+    if (!applyProcess(pid)) pendingProcessId.value = pid
+  } else if (wantedItem) {
+    itemId.value = wantedItem
+    const target = wbsById.value.get(wantedItem)
+    divisionId.value = target?.parentId ?? ''
+    const div = divisionId.value ? wbsById.value.get(divisionId.value) : undefined
+    unitId.value = div?.parentId ?? ''
   }
+
   if (id) {
     const row = await getRecord(id)
     if (row) {
       recordId.value = row.id
-      processId.value = row.processId
-      cascaderValue.value = row.processId
-      processPath.value = pathOf(row.processId)
+      if (!pid) {
+        if (!applyProcess(row.processId)) pendingProcessId.value = row.processId
+      }
       date.value = row.date
       startTime.value = row.startTime
       endTime.value = row.endTime
@@ -283,6 +478,7 @@ watch(
 )
 
 onMounted(() => {
+  void loadMemory()
   void loadFromQuery()
 })
 </script>
@@ -293,14 +489,48 @@ onMounted(() => {
   <div class="page">
     <van-cell-group inset>
       <van-field
-        :model-value="processPath || ''"
-        label="工序"
-        placeholder="选择单位工程 / 分部 / 分项 / 工序"
+        :model-value="unit?.name ?? ''"
+        label="单位工程"
+        placeholder="选择单位工程"
         readonly
         is-link
         required
-        @click="showCascader = true"
+        @click="openPicker('unit')"
       />
+      <van-field
+        :model-value="division?.name ?? ''"
+        label="分部工程"
+        :placeholder="unitId ? '选择分部工程' : '请先选单位工程'"
+        readonly
+        is-link
+        required
+        :disabled="!unitId"
+        @click="openPicker('division')"
+      />
+      <van-field
+        :model-value="item?.name ?? ''"
+        label="分项工程"
+        :placeholder="divisionId ? '选择分项工程（可搜索）' : '请先选分部工程'"
+        readonly
+        is-link
+        required
+        :disabled="!divisionId"
+        @click="openPicker('item')"
+      />
+      <van-field
+        :model-value="selectedProcess?.name ?? ''"
+        label="工序"
+        :placeholder="itemId ? '选择工序，或新增一道' : '请先选分项工程'"
+        readonly
+        is-link
+        required
+        :disabled="!itemId"
+        @click="showProcessSheet = true"
+      />
+      <div v-if="item?.note" class="item-note">{{ item.note }}</div>
+    </van-cell-group>
+
+    <van-cell-group inset style="margin-top: 12px">
       <van-field :model-value="date" label="施工日期" readonly is-link required @click="showCalendar = true" />
       <van-field label="快捷补填">
         <template #input>
@@ -377,15 +607,107 @@ onMounted(() => {
     <van-button type="primary" round :loading="saving" @click="save">保存记录</van-button>
   </div>
 
-  <van-popup v-model:show="showCascader" round position="bottom">
-    <van-cascader
-      v-model="cascaderValue"
-      title="选择工序"
-      :options="cascaderOptions"
-      active-color="#1f6feb"
-      @close="showCascader = false"
-      @finish="onCascaderFinish"
-    />
+  <!-- 单位 / 分部 / 分项：按上一级筛选，分项可搜索 -->
+  <van-popup v-model:show="showPicker" round position="bottom" :style="{ maxHeight: '78%' }">
+    <div class="sheet">
+      <div class="sheet-head">
+        <div class="sheet-title">{{ pickerTitle }}</div>
+        <span class="muted" @click="pickerLevel = ''">关闭</span>
+      </div>
+      <van-search v-if="pickerLevel === 'item'" v-model="search" placeholder="搜索分项工程名称或桩号" />
+      <div class="sheet-body">
+        <van-cell
+          v-for="opt in pickerOptions"
+          :key="opt.id"
+          :title="opt.name"
+          :label="opt.note"
+          clickable
+          @click="chooseNode(opt.id)"
+        >
+          <template #right-icon>
+            <van-icon v-if="opt.id === currentPickId" name="success" color="#1f6feb" />
+          </template>
+        </van-cell>
+        <van-empty v-if="!pickerOptions.length" description="没有可选项" image-size="60" />
+      </div>
+    </div>
+  </van-popup>
+
+  <!-- 工序：先看已有的，再看同类分项用过的和按项目划分推荐的，都没有就现场新增 -->
+  <van-popup v-model:show="showProcessSheet" round position="bottom" :style="{ maxHeight: '82%' }">
+    <div class="sheet">
+      <div class="sheet-head">
+        <div>
+          <div class="sheet-title">选择工序</div>
+          <div class="muted">{{ item?.name ?? '未选分项工程' }}</div>
+        </div>
+        <van-button size="small" type="primary" plain :disabled="!itemId" @click="openNewProcess">＋ 新增工序</van-button>
+      </div>
+      <div class="sheet-body">
+        <template v-if="itemProcesses.length">
+          <div class="group-title">本分项已有（{{ itemProcesses.length }}）</div>
+          <van-cell v-for="p in itemProcesses" :key="p.id" :title="p.name" clickable @click="pickProcess(p)">
+            <template #right-icon>
+              <van-icon v-if="p.id === processId" name="success" color="#1f6feb" style="margin-right: 8px" />
+              <span class="mini-link" @click.stop="openRenameProcess(p)">改名</span>
+            </template>
+          </van-cell>
+        </template>
+
+        <template v-if="recommendation.learned.length">
+          <div class="group-title">同类分项用过（点一下即建到本分项）</div>
+          <van-cell
+            v-for="name in recommendation.learned"
+            :key="`learned-${name}`"
+            :title="name"
+            clickable
+            @click="pickRecommended(name)"
+          >
+            <template #right-icon><van-tag plain type="warning">记忆</van-tag></template>
+          </van-cell>
+        </template>
+
+        <template v-if="recommendation.preset.length">
+          <div class="group-title">{{ recommendation.label }}推荐（点一下即建到本分项）</div>
+          <van-cell
+            v-for="name in recommendation.preset"
+            :key="`preset-${name}`"
+            :title="name"
+            clickable
+            @click="pickRecommended(name)"
+          >
+            <template #right-icon><van-tag plain type="primary">推荐</van-tag></template>
+          </van-cell>
+        </template>
+
+        <van-empty
+          v-if="!itemProcesses.length && !recommendation.learned.length && !recommendation.preset.length"
+          description="这道分项还没有工序，点右上角新增一道"
+          image-size="60"
+        />
+      </div>
+    </div>
+  </van-popup>
+
+  <!-- 新增 / 改名 -->
+  <van-popup v-model:show="processEditor.show" round position="bottom">
+    <div class="sheet">
+      <div class="sheet-head">
+        <div class="sheet-title">{{ processEditor.id ? '修改工序名称' : '新增工序' }}</div>
+      </div>
+      <div class="sheet-body">
+        <van-field v-model="processEditor.name" label="工序名称" placeholder="如：掌子面清理" maxlength="30" />
+        <van-field v-model="processEditor.unit" label="计量单位" placeholder="可留空，默认沿用分项工程" maxlength="10" />
+        <div class="muted" style="padding: 10px 16px 0">
+          <template v-if="processEditor.id">改名会同步到另一台手机；已有记录不受影响。</template>
+          <template v-else>新增后自动选中，并记住“这类分项常用这道工序”，下次会自动出现在推荐里。</template>
+        </div>
+      </div>
+      <div class="sheet-foot">
+        <van-button block round @click="processEditor.show = false">取消</van-button>
+        <van-button block round type="primary" :loading="savingProcess" @click="submitProcess">保存工序</van-button>
+      </div>
+    </div>
   </van-popup>
 
   <van-calendar
@@ -422,6 +744,12 @@ onMounted(() => {
   color: #8b95a1;
 }
 
+.item-note {
+  padding: 0 16px 10px;
+  font-size: 12px;
+  color: #8b95a1;
+}
+
 .quick-dates {
   display: flex;
   align-items: center;
@@ -442,5 +770,50 @@ onMounted(() => {
   border-color: #1f6feb;
   background: #eef3ff;
   color: #1f6feb;
+}
+
+.sheet {
+  display: flex;
+  flex-direction: column;
+  max-height: 80vh;
+}
+
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid #f0f2f5;
+}
+
+.sheet-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #1b2430;
+}
+
+.sheet-body {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: 8px;
+}
+
+.group-title {
+  padding: 12px 16px 4px;
+  font-size: 12px;
+  color: #8b95a1;
+}
+
+.mini-link {
+  font-size: 12px;
+  color: #1f6feb;
+}
+
+.sheet-foot {
+  display: flex;
+  gap: 12px;
+  padding: 12px 16px 18px;
+  border-top: 1px solid #f0f2f5;
 }
 </style>
