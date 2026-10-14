@@ -1,10 +1,12 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
-import { useRouter } from 'vue-router'
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 import type { EChartsOption } from 'echarts'
 import ChartBox from '@/components/ChartBox.vue'
+import DayRing from '@/components/DayRing.vue'
 import StatCard from '@/components/StatCard.vue'
 import ScopePicker from '@/components/ScopePicker.vue'
+import { getKv, setKv } from '@/db'
 import { state } from '@/store'
 import {
   aggregateByProcess,
@@ -13,13 +15,13 @@ import {
   computeGapRows,
   computeStats,
   completionByItem,
-  daysOfPeriod,
-  hoursByDate,
   monthPeriods,
+  monthsWithRecords,
   topGaps,
   weekPeriods,
   type PeriodRange
 } from '@/core/compute'
+import { buildDayRing } from '@/core/dayRing'
 import { aggregateByItem, filterByScope, shortItemLabel, stackedTrend } from '@/core/scope'
 import { GAP_TOLERANCE_MINUTES } from '@/core/reasons'
 import {
@@ -27,9 +29,11 @@ import {
   addMonths,
   endOfMonth,
   endOfWeek,
+  fmtDate,
   fmtHoursShort,
   fmtPercent,
   monthKey,
+  parseDate,
   startOfMonth,
   startOfWeek,
   todayStr
@@ -37,10 +41,15 @@ import {
 
 type PeriodType = 'day' | 'week' | 'month'
 
+const route = useRoute()
 const router = useRouter()
-const periodType = ref<PeriodType>('week')
+const DASHBOARD_KV = 'ui.dashboard'
+
+const periodType = ref<PeriodType>('day')
 const anchor = ref(todayStr())
-const calendarMonth = ref(monthKey(todayStr()))
+const showPeriodPicker = ref(false)
+const showPeriodCalendar = ref(false)
+const calendarValue = ref(parseDate(todayStr()))
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
@@ -228,6 +237,17 @@ const inRange = computed(() =>
 const procAgg = computed(() => aggregateByProcess(inRange.value, processById.value, wbsById.value))
 const itemAgg = computed(() => aggregateByItem(inRange.value, processById.value, wbsById.value))
 
+/** 24 小时圆盘：只在"日"模式用，数据就是当天范围内的记录 */
+const dayRing = computed(() =>
+  buildDayRing({
+    date: anchor.value,
+    records: inRange.value,
+    processById: processById.value,
+    wbsById: wbsById.value,
+    byProcess: state.scope.level === 'item'
+  })
+)
+
 /** 范围=整体时，工序条目要带上所属分项工程，否则同名工序分不清 */
 const rankRows = computed(() => {
   const rows = procAgg.value.slice(0, 10)
@@ -407,75 +427,138 @@ const reasonOption = computed<EChartsOption>(() => ({
   ]
 }))
 
-// ------------------------------------------------------------------ 日历
-const hoursMap = computed(() => hoursByDate(scopeRecords.value))
-
-const calendarOption = computed<EChartsOption>(() => {
-  const days: Array<[string, number]> = daysOfPeriod(
-    `${calendarMonth.value}-01`,
-    endOfMonth(`${calendarMonth.value}-01`)
-  ).map((d) => [d, Number((hoursMap.value.get(d) ?? 0).toFixed(2))])
-  const max = Math.max(4, ...days.map((d) => d[1]))
-  return {
-    tooltip: {
-      formatter: (p: unknown) => {
-        const v = p as { data?: [string, number] }
-        return `${v.data?.[0]}<br/>工时 ${v.data?.[1]} 小时`
-      }
-    },
-    visualMap: {
-      min: 0,
-      max,
-      orient: 'horizontal',
-      left: 'center',
-      bottom: 0,
-      itemWidth: 10,
-      itemHeight: 80,
-      textStyle: { fontSize: 9 },
-      inRange: { color: ['#eef4ff', '#a9c8ff', '#5b96ff', '#1f6feb'] }
-    },
-    calendar: {
-      top: 22,
-      left: 30,
-      right: 10,
-      bottom: 46,
-      range: calendarMonth.value,
-      cellSize: ['auto', 'auto'],
-      splitLine: { show: false },
-      itemStyle: { borderWidth: 2, borderColor: '#fff', color: '#f2f4f7' },
-      dayLabel: { firstDay: 1, fontSize: 9, color: '#8b95a1', nameMap: ['日', '一', '二', '三', '四', '五', '六'] },
-      monthLabel: { show: false },
-      yearLabel: { show: false }
-    },
-    series: [
-      {
-        type: 'heatmap',
-        coordinateSystem: 'calendar',
-        data: days,
-        label: {
-          show: true,
-          fontSize: 9,
-          color: '#4a5461',
-          formatter: (p: unknown) => String((p as { data: [string, number] }).data[0]).slice(-2)
-        }
-      }
-    ]
-  }
-})
-
 const itemProgress = computed(() => completionByItem(inRange.value, processById.value, wbsById.value))
 
+// ------------------------------------------------------- 选日期 / 选周期
+// 不再只靠左右箭头：点周期标签就能跳到任意一天、任意一月
 function move(delta: number) {
   if (periodType.value === 'day') anchor.value = addDays(anchor.value, delta)
   else if (periodType.value === 'week') anchor.value = addDays(anchor.value, delta * 7)
   else anchor.value = `${addMonths(monthKey(anchor.value), delta)}-01`
-  calendarMonth.value = monthKey(anchor.value)
 }
 
 function goToday() {
   anchor.value = todayStr()
-  calendarMonth.value = monthKey(anchor.value)
 }
+
+/** 当前范围内最近 12 个有记录的日期 / 月份，一点直达 */
+const datesWithData = computed(() => {
+  const set = new Set(scopeRecords.value.map((r) => r.date))
+  return Array.from(set).sort().reverse().slice(0, 12)
+})
+
+const monthsWithData = computed(() => monthsWithRecords(scopeRecords.value).slice(-12).reverse())
+
+/** 年 + 月 两列，给"月"模式用 */
+const monthColumns = computed(() => {
+  const thisYear = new Date().getFullYear()
+  const years: Array<{ text: string; value: string }> = []
+  for (let y = 2024; y <= thisYear; y += 1) years.push({ text: `${y}年`, value: String(y) })
+  const months = Array.from({ length: 12 }, (_, i) => ({
+    text: `${i + 1}月`,
+    value: String(i + 1).padStart(2, '0')
+  }))
+  return [years, months]
+})
+
+const monthPickerValue = ref<string[]>([anchor.value.slice(0, 4), anchor.value.slice(5, 7)])
+
+/** 打开选择器时把当前所在月份同步给年月选择器，避免它显示成上一次的值 */
+function openPeriodPicker() {
+  monthPickerValue.value = [anchor.value.slice(0, 4), anchor.value.slice(5, 7)]
+  showPeriodPicker.value = true
+}
+
+const pickerTitle = computed(() => {
+  if (periodType.value === 'day') return '选择日期'
+  if (periodType.value === 'week') return '选择某一周（选那天所在的周）'
+  return '选择月份'
+})
+
+function pickAnchorDate(date: string) {
+  showPeriodPicker.value = false
+  anchor.value = date
+}
+
+function pickAnchorMonth(month: string) {
+  showPeriodPicker.value = false
+  anchor.value = `${month}-01`
+}
+
+function openPeriodCalendar() {
+  showPeriodPicker.value = false
+  showPeriodCalendar.value = true
+}
+
+function onPeriodCalendarConfirm(value: Date) {
+  showPeriodCalendar.value = false
+  anchor.value = fmtDate(value)
+}
+
+function onMonthPickerConfirm(payload: { selectedValues?: Array<string | number> }) {
+  const values = payload.selectedValues ?? []
+  const y = String(values[0] ?? '')
+  const m = String(values[1] ?? '').padStart(2, '0')
+  if (y && m) pickAnchorMonth(`${y}-${m}`)
+}
+
+/** 底部按钮：把当前正在看的周期带进明细页 */
+function openRecords() {
+  if (periodType.value === 'day') {
+    void router.push({ path: '/records', query: { month: monthKey(anchor.value), date: anchor.value } })
+  } else {
+    void router.push({ path: '/records', query: { month: monthKey(range.value.from) } })
+  }
+}
+
+/** 圆盘上的扇段 / 清单点一下，进那条记录的编辑页 */
+function openRecord(recordId: string) {
+  void router.push({ path: '/record', query: { id: recordId } })
+}
+
+const recordsButtonLabel = computed(() =>
+  periodType.value === 'day'
+    ? `查看记录明细（${anchor.value.slice(5)}）`
+    : `查看记录明细（${monthKey(range.value.from)}）`
+)
+
+// 记住上次看的周期与位置（本机），切来切去不会跳回今天
+watch([periodType, anchor], () => {
+  calendarValue.value = parseDate(anchor.value)
+  void setKv(DASHBOARD_KV, { periodType: periodType.value, anchor: anchor.value })
+})
+
+async function initPosition() {
+  const qPeriod = typeof route.query.period === 'string' ? route.query.period : ''
+  const qDate =
+    typeof route.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(route.query.date) ? route.query.date : ''
+  if (qPeriod === 'day' || qPeriod === 'week' || qPeriod === 'month') periodType.value = qPeriod
+  if (qDate) {
+    anchor.value = qDate
+    return
+  }
+  if (!qPeriod) {
+    const saved = await getKv<{ periodType?: PeriodType; anchor?: string } | null>(DASHBOARD_KV, null)
+    if (saved?.periodType) periodType.value = saved.periodType
+    if (saved?.anchor) anchor.value = saved.anchor
+    else anchor.value = latestDayWithRecords()
+  }
+}
+
+/**
+ * 默认定位：今天有记录就看今天；今天还没记（早上刚打开、或最近停工），
+ * 直接落到最近有记录的那一天，省得一进来是空图。
+ */
+function latestDayWithRecords(): string {
+  const today = todayStr()
+  const dates = scopeRecords.value.map((r) => r.date)
+  if (!dates.length || dates.includes(today)) return today
+  return dates.sort()[dates.length - 1]
+}
+
+onMounted(() => {
+  void initPosition()
+})
 </script>
 
 <template>
@@ -484,7 +567,7 @@ function goToday() {
   <div class="page">
     <ScopePicker />
 
-    <van-tabs v-model:active="periodType" type="card" @change="goToday">
+    <van-tabs v-model:active="periodType" type="card">
       <van-tab title="日" name="day" />
       <van-tab title="周" name="week" />
       <van-tab title="月" name="month" />
@@ -493,14 +576,15 @@ function goToday() {
     <div class="card" style="margin-top: 12px">
       <div class="row-between">
         <van-icon name="arrow-left" size="18" @click="move(-1)" />
-        <div style="text-align: center; min-width: 0">
-          <div class="num" style="font-size: 14px; font-weight: 600">{{ periodLabel }}</div>
-          <div class="muted" @click="goToday">点这里回到今天</div>
+        <div class="period-center" @click="openPeriodPicker">
+          <div class="num period-label">{{ periodLabel }}<van-icon name="arrow-down" size="12" /></div>
+          <div class="muted">点这里选日期</div>
         </div>
         <van-icon name="arrow" size="18" @click="move(1)" />
       </div>
       <div class="divider" />
       <div class="muted scope-echo">当前范围：{{ scopeName }}</div>
+      <div class="muted today-link" @click="goToday">回到今天</div>
     </div>
 
     <div class="kpi-grid">
@@ -549,12 +633,13 @@ function goToday() {
       有 {{ exceedPeriods.length }} 天单日工时超过 24 小时（图中日期标红），可能是同一天有重复或重叠记录，建议到明细页核对。
     </div>
 
-    <div class="card">
+    <div v-if="periodType === 'day'" class="card">
       <div class="card-title">
-        {{ trendTitle }}
-        <span class="sub">柱：工时构成　线：效率</span>
+        一天在干什么（24 小时圆盘）
+        <span class="sub">整圈 24h · 半圈 12h</span>
       </div>
-      <ChartBox :option="trendOption" :height="270" />
+      <DayRing v-if="dayRing.stats.count" :data="dayRing" :date-label="anchor.slice(5)" @pick="openRecord" />
+      <van-empty v-else description="这一天没有记录" image-size="60" />
     </div>
 
     <div class="card">
@@ -580,6 +665,14 @@ function goToday() {
 
     <div class="card">
       <div class="card-title">
+        {{ trendTitle }}
+        <span class="sub">柱：工时构成　线：效率</span>
+      </div>
+      <ChartBox :option="trendOption" :height="270" />
+    </div>
+
+    <div class="card">
+      <div class="card-title">
         衔接空隙排行
         <span class="sub">超过 {{ GAP_TOLERANCE_MINUTES }} 分钟、6 小时以内</span>
       </div>
@@ -598,14 +691,6 @@ function goToday() {
       </div>
       <ChartBox v-if="reasonAgg.length" :option="reasonOption" :height="250" />
       <van-empty v-else description="还没有填写等待原因" image-size="60" />
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        日历热力图
-        <span class="sub">{{ calendarMonth }} 每日工时</span>
-      </div>
-      <ChartBox :option="calendarOption" :height="260" />
     </div>
 
     <div v-if="itemProgress.some((i) => i.doneQty > 0)" class="card">
@@ -631,16 +716,63 @@ function goToday() {
       </div>
     </div>
 
-    <van-button
-      block
-      plain
-      type="primary"
-      @click="router.push({ path: '/records', query: { month: calendarMonth } })"
-    >
-      查看记录明细（{{ calendarMonth }}）
-    </van-button>
+    <van-button block plain type="primary" @click="openRecords">{{ recordsButtonLabel }}</van-button>
     <div class="bottom-space" />
   </div>
+
+  <!-- 选日期：有记录的日期一点直达，要更早的再开日历 -->
+  <van-popup v-model:show="showPeriodPicker" round position="bottom" :style="{ maxHeight: '76%' }">
+    <div class="sheet">
+      <div class="sheet-head">
+        <div class="sheet-title">{{ pickerTitle }}</div>
+        <span class="muted" @click="showPeriodPicker = false">关闭</span>
+      </div>
+      <div class="sheet-body">
+        <template v-if="periodType === 'month'">
+          <div class="group-title">有记录的月份（近 12 个）</div>
+          <div class="chip-row">
+            <button v-for="m in monthsWithData" :key="m" type="button" class="chip" @click="pickAnchorMonth(m)">
+              {{ m }}
+            </button>
+          </div>
+          <div class="group-title">或按月选择</div>
+          <div class="sheet-actions">
+            <van-picker
+              :columns="monthColumns"
+              :model-value="monthPickerValue"
+              title=""
+              @confirm="onMonthPickerConfirm"
+            />
+          </div>
+        </template>
+
+        <template v-else>
+          <div class="group-title">有记录的日期（近 12 个）</div>
+          <div v-if="datesWithData.length" class="chip-row">
+            <button v-for="d in datesWithData" :key="d" type="button" class="chip" @click="pickAnchorDate(d)">
+              {{ d.slice(5) }}
+            </button>
+          </div>
+          <div v-else class="group-title">当前范围内还没有记录</div>
+          <div class="group-title">
+            {{ periodType === 'week' ? '选那一天，看它所在的周（周一~周日）' : '或按日历选任意一天' }}
+          </div>
+          <div class="sheet-actions">
+            <van-button block round type="primary" plain @click="openPeriodCalendar">打开日历选择</van-button>
+          </div>
+        </template>
+      </div>
+    </div>
+  </van-popup>
+
+  <van-calendar
+    v-model:show="showPeriodCalendar"
+    :default-date="calendarValue"
+    :min-date="new Date(2024, 0, 1)"
+    :max-date="new Date()"
+    switch-mode="year-month"
+    @confirm="onPeriodCalendarConfirm"
+  />
 </template>
 
 <style scoped>
@@ -668,5 +800,74 @@ function goToday() {
 
 .scope-echo {
   word-break: break-all;
+}
+
+.period-center {
+  min-width: 0;
+  text-align: center;
+}
+
+.period-label {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.today-link {
+  text-align: center;
+  margin-top: 6px;
+  color: #1f6feb;
+}
+
+.sheet {
+  display: flex;
+  flex-direction: column;
+  max-height: 76vh;
+}
+
+.sheet-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px 10px;
+  border-bottom: 1px solid #f0f2f5;
+}
+
+.sheet-title {
+  font-size: 16px;
+  font-weight: 600;
+  color: #1b2430;
+}
+
+.sheet-body {
+  flex: 1;
+  overflow-y: auto;
+  padding-bottom: 16px;
+}
+
+.group-title {
+  padding: 12px 16px 6px;
+  font-size: 12px;
+  color: #8b95a1;
+}
+
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 16px;
+}
+
+.chip {
+  border: 1px solid #dfe4ea;
+  background: #f8f9fb;
+  border-radius: 999px;
+  padding: 7px 14px;
+  font-size: 13px;
+  color: #33404f;
+}
+
+.sheet-actions {
+  padding: 6px 8px 0;
 }
 </style>

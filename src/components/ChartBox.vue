@@ -13,6 +13,7 @@ import {
 } from 'echarts/components'
 import { CanvasRenderer } from 'echarts/renderers'
 import type { EChartsOption } from 'echarts'
+import { withMobileTooltip } from '@/core/chartTheme'
 
 echarts.use([
   BarChart,
@@ -37,7 +38,8 @@ let observer: ResizeObserver | null = null
 
 function render() {
   if (!chart) return
-  chart.setOption(props.option, true)
+  // 统一兜底：手机上 tooltip 不出框、长文字换行（各图自己的 formatter 不受影响）
+  chart.setOption(withMobileTooltip(props.option), true)
 }
 
 onMounted(() => {

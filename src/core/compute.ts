@@ -375,6 +375,30 @@ export function hoursByDate(records: ProcessRecord[]): Map<ISODate, number> {
   return map
 }
 
+export interface DaySummary {
+  date: ISODate
+  count: number
+  hours: number
+  /** 当天各条记录自己的衔接空隙之和（空隙记在后一道工序上，所以归到它的日期） */
+  gapHours: number
+}
+
+/**
+ * 每天一行汇总（明细页月总览用）：只返回有记录的天，按日期倒序。
+ * gapByRecord 用 computeGapRows 在"整月记录"上算出来的结果，跨月衔接不会被截断。
+ */
+export function daySummaries(records: ProcessRecord[], gapByRecord: Map<string, number>): DaySummary[] {
+  const map = new Map<ISODate, DaySummary>()
+  activeRecords(records).forEach((r) => {
+    const row = map.get(r.date) ?? { date: r.date, count: 0, hours: 0, gapHours: 0 }
+    row.count += 1
+    row.hours += Number.isFinite(r.hours) ? r.hours : 0
+    row.gapHours += gapByRecord.get(r.id) ?? 0
+    map.set(r.date, row)
+  })
+  return Array.from(map.values()).sort((a, b) => (a.date < b.date ? 1 : -1))
+}
+
 export interface TrendPoint {
   key: string
   label: string
