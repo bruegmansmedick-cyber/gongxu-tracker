@@ -85,6 +85,40 @@ export function minutesToHhmm(m: number): HHMM {
   return `${pad2(Math.floor(v / 60))}:${pad2(v % 60)}`
 }
 
+/**
+ * 宽松解析手工输入的时刻，统一成 HH:mm。
+ * 允许：08:30 / 8:30 / 8：30 / 830 / 0830 / 08.30，前后空格自动去掉。
+ * 不合法（时辰超过 23、分钟超过 59、空）返回 null，由界面提示重填。
+ */
+export function parseLooseTime(input: string): HHMM | null {
+  const s = String(input ?? '')
+    .trim()
+    .replace(/[：.]/g, ':')
+    .replace(/\s+/g, '')
+  if (!s) return null
+
+  const withColon = /^(\d{1,2}):(\d{1,2})$/.exec(s)
+  if (withColon) {
+    const h = Number(withColon[1])
+    const m = Number(withColon[2])
+    if (h > 23 || m > 59) return null
+    return `${pad2(h)}:${pad2(m)}`
+  }
+
+  const digits = s.replace(/\D/g, '')
+  if (digits.length === 3) {
+    const h = Number(digits.slice(0, 1))
+    const m = Number(digits.slice(1))
+    return m > 59 ? null : `${pad2(h)}:${pad2(m)}`
+  }
+  if (digits.length === 4) {
+    const h = Number(digits.slice(0, 2))
+    const m = Number(digits.slice(2))
+    return h > 23 || m > 59 ? null : `${pad2(h)}:${pad2(m)}`
+  }
+  return null
+}
+
 /** 小时数转 "8小时30分" */
 export function fmtHours(h: number): string {
   if (!Number.isFinite(h) || h <= 0) return '0小时'

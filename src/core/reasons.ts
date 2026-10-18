@@ -26,11 +26,57 @@ export const GAP_REASONS: ReasonOption[] = [
 
 export function reasonLabel(key?: string): string {
   if (!key) return '未填写'
+  if (key === 'unknown') return '未填写原因'
   return GAP_REASONS.find((r) => r.key === key)?.label ?? key
 }
 
+/** 自定义原因没有固定色号：按文字稳定取色，保证同一个原因在饼图里始终同色 */
+const CUSTOM_REASON_COLORS = [
+  '#78716c',
+  '#0d9488',
+  '#7c3aed',
+  '#c026d3',
+  '#db2777',
+  '#ca8a04',
+  '#0284c7',
+  '#65a30d'
+]
+
 export function reasonColor(key?: string): string {
-  return GAP_REASONS.find((r) => r.key === key)?.color ?? '#9ca3af'
+  const hit = GAP_REASONS.find((r) => r.key === key)
+  if (hit) return hit.color
+  if (!key) return '#9ca3af'
+  let hash = 0
+  for (const ch of key) hash = (hash * 31 + (ch.codePointAt(0) ?? 0)) % 100000
+  return CUSTOM_REASON_COLORS[hash % CUSTOM_REASON_COLORS.length]
+}
+
+/** 本机自定义等待原因的上限（防止列表无限变长） */
+export const MAX_CUSTOM_REASONS = 20
+
+/**
+ * 合并自定义等待原因：本机记住的 + 历史记录里出现过的。
+ *
+ * 自定义原因的 key 直接就是文字本身，所以它随记录一起同步——另一台手机即使没加过，
+ * 也能从已有记录里把这条原因收进候选列表。
+ * 内置原因的 key 和文字都会被排除，避免重复。
+ */
+export function mergeCustomReasons(saved: string[], fromRecords: string[] = []): string[] {
+  const taken = new Set<string>()
+  GAP_REASONS.forEach((r) => {
+    taken.add(r.key)
+    taken.add(r.label)
+  })
+  const out: string[] = []
+  const push = (raw: string) => {
+    const text = String(raw ?? '').trim()
+    if (!text || text === 'none' || taken.has(text) || text.length > 20) return
+    taken.add(text)
+    out.push(text)
+  }
+  saved.forEach(push)
+  fromRecords.forEach(push)
+  return out.slice(0, MAX_CUSTOM_REASONS)
 }
 
 /** 衔接小于该值（分钟）视为正常衔接，不计入"空隙问题" */

@@ -6,10 +6,10 @@ import { afterChange, state } from '@/store'
 import { deleteRecord as removeRecord, getKv, getRecord, saveProcess, saveRecord, setKv } from '@/db'
 import { buildTimeFields, suggestStandardHours } from '@/core/compute'
 import { checkBeforeSave } from '@/core/health'
-import { GAP_REASONS } from '@/core/reasons'
+import { GAP_REASONS, MAX_CUSTOM_REASONS, mergeCustomReasons } from '@/core/reasons'
 import { recommendProcesses, rememberProcess, type ProcessMemory } from '@/core/recommend'
 import { buildUsageIndex, predictSelection, rankByUsage } from '@/core/predict'
-import { addDays, fmtDate, fmtHours, friendlyDate, nowHhmm, todayStr } from '@/core/time'
+import { addDays, fmtDate, fmtHours, friendlyDate, nowHhmm, parseLooseTime, todayStr } from '@/core/time'
 import type { Process, WbsLevel, WbsNode } from '@/types'
 
 const route = useRoute()
@@ -25,6 +25,11 @@ const processId = ref('')
 const date = ref(todayStr())
 const startTime = ref('08:00')
 const endTime = ref('12:00')
+/** 输入框里的原始文字；失焦或保存时再校验并写回 startTime / endTime */
+const startInput = ref(startTime.value)
+const endInput = ref(endTime.value)
+/** 输入的时刻格式不对时标红提示（不偷偷改回旧值） */
+const timeInvalid = reactive({ start: false, end: false })
 const quantity = ref<string>('')
 const gapReason = ref('none')
 const location = ref('')
@@ -32,10 +37,9 @@ const note = ref('')
 const saving = ref(false)
 
 const showCalendar = ref(false)
-const showStartPicker = ref(false)
-const showEndPicker = ref(false)
 const showReasonPicker = ref(false)
 const showProcessSheet = ref(false)
+const reasonEditor = reactive({ show: false, name: '' })
 
 /** 结构选择弹层：unit / division / item 三选一，空串表示关闭 */
 const pickerLevel = ref<'' | 'unit' | 'division' | 'item'>('')
@@ -61,9 +65,8 @@ const savingProcess = ref(false)
  * 所以这里始终保持普通对象。
  */
 const memory = shallowRef<ProcessMemory>({})
-
-const startPickerValue = ref<string[]>(startTime.value.split(':'))
-const endPickerValue = ref<string[]>(endTime.value.split(':'))
+/** 本机记住的自定义等待原因 */
+const customReasons = shallowRef<string[]>([])
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
@@ -141,8 +144,19 @@ const crossMidnight = computed(() => {
   return eh * 60 + em <= sh * 60 + sm
 })
 
-const reasonActions = GAP_REASONS.map((r) => ({ name: r.label, value: r.key }))
-const reasonText = computed(() => GAP_REASONS.find((r) => r.key === gapReason.value)?.label ?? '')
+/** 等待原因显示：内置的查表，自己加的显示原文 */
+const reasonText = computed(() => {
+  if (!gapReason.value || gapReason.value === 'none') return '衔接正常（无等待）'
+  return GAP_REASONS.find((r) => r.key === gapReason.value)?.label ?? gapReason.value
+})
+
+/** 记录里出现过的自定义原因（可能是另一台手机加的，随记录同步过来） */
+const recordReasons = computed(() =>
+  state.records.map((r) => r.gapReason ?? '').filter((k) => k && k !== 'none')
+)
+
+/** 选择器里"自己加过"的那一组 */
+const customReasonOptions = computed(() => mergeCustomReasons(customReasons.value, recordReasons.value))
 
 const historyHint = computed(() => {
   if (!processId.value) return ''
@@ -339,29 +353,93 @@ function setQuickDate(value: string) {
   date.value = value
 }
 
-function onStartConfirm() {
-  startTime.value = startPickerValue.value.map((v) => String(v).padStart(2, '0')).join(':')
-  showStartPicker.value = false
+/** 输入框只留数字和冒号，其它字符直接挡掉 */
+function onTimeInput(kind: 'start' | 'end', raw: string) {
+  const cleaned = String(raw ?? '').replace(/[^\d:]/g, '').slice(0, 5)
+  timeInvalid[kind] = false
+  if (kind === 'start') startInput.value = cleaned
+  else endInput.value = cleaned
 }
 
-function onEndConfirm() {
-  endTime.value = endPickerValue.value.map((v) => String(v).padStart(2, '0')).join(':')
-  showEndPicker.value = false
+/** 失焦或保存时校验并规范成 HH:mm；不合法就保留原文并标红，等用户改 */
+function commitTime(kind: 'start' | 'end'): boolean {
+  const raw = kind === 'start' ? startInput.value : endInput.value
+  const parsed = parseLooseTime(raw)
+  if (!parsed) {
+    timeInvalid[kind] = true
+    return false
+  }
+  timeInvalid[kind] = false
+  if (kind === 'start') {
+    startTime.value = parsed
+    startInput.value = parsed
+  } else {
+    endTime.value = parsed
+    endInput.value = parsed
+  }
+  return true
 }
 
-function onReasonSelect(action: { value: string }) {
-  gapReason.value = action.value
-  showReasonPicker.value = false
+function commitTimes(): boolean {
+  const okStart = commitTime('start')
+  const okEnd = commitTime('end')
+  return okStart && okEnd
+}
+
+function setTime(kind: 'start' | 'end', value: string) {
+  timeInvalid[kind] = false
+  if (kind === 'start') {
+    startTime.value = value
+    startInput.value = value
+  } else {
+    endTime.value = value
+    endInput.value = value
+  }
 }
 
 function fillNowStart() {
-  startTime.value = nowHhmm()
-  startPickerValue.value = startTime.value.split(':')
+  setTime('start', nowHhmm())
 }
 
 function fillNowEnd() {
-  endTime.value = nowHhmm()
-  endPickerValue.value = endTime.value.split(':')
+  setTime('end', nowHhmm())
+}
+
+function pickReason(key: string) {
+  gapReason.value = key
+  showReasonPicker.value = false
+}
+
+function openReasonEditor() {
+  reasonEditor.name = ''
+  reasonEditor.show = true
+}
+
+/** 新增原因：文字本身就是 key，随记录同步；同时记住到本机候选列表 */
+async function submitReason() {
+  const text = reasonEditor.name.trim()
+  if (!text) {
+    showToast('请填原因')
+    return
+  }
+  if (text.length > 20) {
+    showToast('原因最多 20 字')
+    return
+  }
+  const builtin = GAP_REASONS.find((r) => r.label === text || r.key === text)
+  if (builtin) {
+    pickReason(builtin.key)
+    reasonEditor.show = false
+    showToast(`已选：${builtin.label}`)
+    return
+  }
+  const next = mergeCustomReasons([text, ...customReasons.value], recordReasons.value)
+  customReasons.value = next
+  await setKv('ui.customReasons', next)
+  gapReason.value = text
+  reasonEditor.show = false
+  showReasonPicker.value = false
+  showToast(`已新增原因：${text}`)
 }
 
 async function save() {
@@ -376,6 +454,11 @@ async function save() {
   }
   if (!state.currentOperatorId) {
     showToast('请先在“设置”里添加记录人')
+    return
+  }
+  // 输入框可能还没失焦，先校验并规范成 HH:mm
+  if (!commitTimes()) {
+    showToast('请先改正时间格式，如 08:30')
     return
   }
   saving.value = true
@@ -467,6 +550,7 @@ watch([() => state.ready, () => state.wbs.length], applyPending)
 
 async function loadMemory() {
   memory.value = await getKv<ProcessMemory>('ui.processMemory', {})
+  customReasons.value = await getKv<string[]>('ui.customReasons', [])
 }
 
 /** 按地址栏参数初始化表单；query 变化时也重跑，避免路由复用组件时串数据 */
@@ -489,6 +573,10 @@ async function loadFromQuery() {
   date.value = d || todayStr()
   startTime.value = '08:00'
   endTime.value = '12:00'
+  startInput.value = startTime.value
+  endInput.value = endTime.value
+  timeInvalid.start = false
+  timeInvalid.end = false
   quantity.value = ''
   gapReason.value = 'none'
   location.value = ''
@@ -514,16 +602,16 @@ async function loadFromQuery() {
       date.value = row.date
       startTime.value = row.startTime
       endTime.value = row.endTime
-      startPickerValue.value = row.startTime.split(':')
-      endPickerValue.value = row.endTime.split(':')
+      startInput.value = row.startTime
+      endInput.value = row.endTime
       quantity.value = row.quantity === undefined ? '' : String(row.quantity)
       gapReason.value = row.gapReason ?? 'none'
       location.value = row.location ?? ''
       note.value = row.note ?? ''
     }
   }
-  startPickerValue.value = startTime.value.split(':')
-  endPickerValue.value = endTime.value.split(':')
+  startInput.value = startTime.value
+  endInput.value = endTime.value
 }
 
 watch(
@@ -614,12 +702,34 @@ onMounted(() => {
           </div>
         </template>
       </van-field>
-      <van-field :model-value="startTime" label="开工时刻" readonly is-link required @click="showStartPicker = true">
+      <van-field
+        :model-value="startInput"
+        label="开工时刻"
+        type="text"
+        inputmode="numeric"
+        maxlength="5"
+        placeholder="如 08:30，或只输 830"
+        :error-message="timeInvalid.start ? '格式不对，请按 08:30 填' : ''"
+        required
+        @update:model-value="onTimeInput('start', $event)"
+        @blur="commitTime('start')"
+      >
         <template #button>
           <van-button size="mini" plain type="primary" @click.stop="fillNowStart">现在</van-button>
         </template>
       </van-field>
-      <van-field :model-value="endTime" label="完工时刻" readonly is-link required @click="showEndPicker = true">
+      <van-field
+        :model-value="endInput"
+        label="完工时刻"
+        type="text"
+        inputmode="numeric"
+        maxlength="5"
+        placeholder="如 12:00，或只输 1200"
+        :error-message="timeInvalid.end ? '格式不对，请按 12:00 填' : ''"
+        required
+        @update:model-value="onTimeInput('end', $event)"
+        @blur="commitTime('end')"
+      >
         <template #button>
           <van-button size="mini" plain type="primary" @click.stop="fillNowEnd">现在</van-button>
         </template>
@@ -630,6 +740,7 @@ onMounted(() => {
           <span v-if="crossMidnight" class="tag-soft" style="margin-left: 8px">跨零点</span>
         </template>
       </van-field>
+      <div class="time-hint muted">直接输入时间，如 08:30；也可只输 830。完工早于开工会自动按跨零点算。</div>
     </van-cell-group>
 
     <van-cell-group inset style="margin-top: 12px">
@@ -784,20 +895,59 @@ onMounted(() => {
     @confirm="onCalendarConfirm"
   />
 
-  <van-popup v-model:show="showStartPicker" round position="bottom">
-    <van-time-picker v-model="startPickerValue" title="开工时刻" @confirm="onStartConfirm" @cancel="showStartPicker = false" />
-  </van-popup>
-  <van-popup v-model:show="showEndPicker" round position="bottom">
-    <van-time-picker v-model="endPickerValue" title="完工时刻" @confirm="onEndConfirm" @cancel="showEndPicker = false" />
+  <!-- 等待原因：内置 + 自己加过的 + 现场新增 -->
+  <van-popup v-model:show="showReasonPicker" round position="bottom" :style="{ maxHeight: '74%' }">
+    <div class="sheet">
+      <div class="sheet-head">
+        <div class="sheet-title">开工前等待的原因</div>
+        <van-button size="small" type="primary" plain @click="openReasonEditor">＋ 新增原因</van-button>
+      </div>
+      <div class="sheet-body">
+        <van-cell v-for="r in GAP_REASONS" :key="r.key" :title="r.label" clickable @click="pickReason(r.key)">
+          <template #right-icon>
+            <van-icon v-if="gapReason === r.key" name="success" color="#1f6feb" />
+          </template>
+        </van-cell>
+
+        <template v-if="customReasonOptions.length">
+          <div class="group-title">自己加过的（本机记住）</div>
+          <van-cell
+            v-for="name in customReasonOptions"
+            :key="name"
+            :title="name"
+            clickable
+            @click="pickReason(name)"
+          >
+            <template #right-icon>
+              <van-icon v-if="gapReason === name" name="success" color="#1f6feb" />
+            </template>
+          </van-cell>
+        </template>
+
+        <div class="muted" style="padding: 12px 16px 0">
+          没有合适的就点右上角「＋ 新增原因」，写一次会记住，下次直接选。
+        </div>
+      </div>
+    </div>
   </van-popup>
 
-  <van-action-sheet
-    v-model:show="showReasonPicker"
-    :actions="reasonActions"
-    cancel-text="取消"
-    title="开工前等待的原因"
-    @select="onReasonSelect"
-  />
+  <van-popup v-model:show="reasonEditor.show" round position="bottom">
+    <div class="sheet">
+      <div class="sheet-head">
+        <div class="sheet-title">新增等待原因</div>
+      </div>
+      <div class="sheet-body">
+        <van-field v-model="reasonEditor.name" label="原因" placeholder="如：等监理旁站" maxlength="20" />
+        <div class="muted" style="padding: 10px 16px 0">
+          保存后会自动选中；本机最多记 {{ MAX_CUSTOM_REASONS }} 条，写的文字会随记录同步到另一台手机。
+        </div>
+      </div>
+      <div class="sheet-foot">
+        <van-button block round @click="reasonEditor.show = false">取消</van-button>
+        <van-button block round type="primary" @click="submitReason">保存并选中</van-button>
+      </div>
+    </div>
+  </van-popup>
 
   <div class="bottom-space" />
 </template>
@@ -817,6 +967,13 @@ onMounted(() => {
 
 .item-note.predicted {
   color: #1f6feb;
+}
+
+.time-hint {
+  padding: 0 16px 10px;
+  font-size: 12px;
+  color: #8b95a1;
+  line-height: 1.5;
 }
 
 .quick-dates {

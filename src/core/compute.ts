@@ -1,5 +1,5 @@
 import type { HHMM, ISODate, Process, ProcessRecord, WbsNode } from '@/types'
-import { GAP_REASONS, GAP_TOLERANCE_MINUTES } from '@/core/reasons'
+import { GAP_TOLERANCE_MINUTES, reasonColor, reasonLabel } from '@/core/reasons'
 import {
   addDays,
   addMonths,
@@ -327,10 +327,9 @@ export function aggregateByReason(gaps: GapRow[], minGapMinutes = GAP_TOLERANCE_
   gaps.forEach((g) => {
     if (g.gapHours < minHours) return
     const key = g.reason || 'unknown'
-    const meta = GAP_REASONS.find((r) => r.key === key)
     const cur =
       map.get(key) ??
-      ({ key, label: meta?.label ?? '未填写原因', color: meta?.color ?? '#9ca3af', hours: 0, count: 0 } satisfies ReasonAgg)
+      ({ key, label: reasonLabel(key), color: reasonColor(key), hours: 0, count: 0 } satisfies ReasonAgg)
     cur.hours += g.gapHours
     cur.count += 1
     map.set(key, cur)

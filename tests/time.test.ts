@@ -1,6 +1,39 @@
 import { describe, expect, it } from 'vitest'
-import { addDays, addMonths, endOfMonth, endOfWeek, fmtHours, listDates, monthKey, startOfMonth, startOfWeek } from '@/core/time'
+import {
+  addDays,
+  addMonths,
+  endOfMonth,
+  endOfWeek,
+  fmtHours,
+  listDates,
+  monthKey,
+  parseLooseTime,
+  startOfMonth,
+  startOfWeek
+} from '@/core/time'
 import { monthPeriods, weekPeriods } from '@/core/compute'
+
+describe('手工输入时刻', () => {
+  it('能宽松解析成 HH:mm', () => {
+    expect(parseLooseTime('08:30')).toBe('08:30')
+    expect(parseLooseTime('8:5')).toBe('08:05')
+    expect(parseLooseTime(' 8：30 ')).toBe('08:30')
+    expect(parseLooseTime('830')).toBe('08:30')
+    expect(parseLooseTime('0830')).toBe('08:30')
+    expect(parseLooseTime('08.30')).toBe('08:30')
+    expect(parseLooseTime('2359')).toBe('23:59')
+    expect(parseLooseTime('0000')).toBe('00:00')
+  })
+
+  it('非法时刻返回 null', () => {
+    expect(parseLooseTime('')).toBeNull()
+    expect(parseLooseTime('abc')).toBeNull()
+    expect(parseLooseTime('24:00')).toBeNull()
+    expect(parseLooseTime('08:60')).toBeNull()
+    expect(parseLooseTime('860')).toBeNull()
+    expect(parseLooseTime('8')).toBeNull()
+  })
+})
 
 describe('周与月的边界', () => {
   it('周一为一周的第一天', () => {
