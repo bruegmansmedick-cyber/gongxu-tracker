@@ -11,7 +11,7 @@
  * 纯函数，不读写数据库。
  */
 import { isActive } from '@/core/compute'
-import { fmtDate } from '@/core/time'
+import { addDays } from '@/core/time'
 import type { ISODate, Process, ProcessRecord } from '@/types'
 
 export type CycleFamily = 'exc' | 'sup'
@@ -161,6 +161,9 @@ export function buildCycles(records: ProcessRecord[], processById: Map<string, P
         )
         if (!block.length) return
         const lastActiveEndAt = Math.max(...block.map((r) => r.endAt))
+        // 记录里的 date/时刻都是本地时间字符串：跨零点看 endTime ≤ startTime，避免依赖运行机器时区
+        const lastRecord = block.reduce((a, b) => (b.endAt > a.endAt ? b : a))
+        const lastEndDate = lastRecord.endTime <= lastRecord.startTime ? addDays(lastRecord.date, 1) : lastRecord.date
         const boundaryEndAt = next ? next.startAt : Math.max(lastActiveEndAt, cur.anchor.endAt)
         const activeHours = mergedHours(
           block.map((r) => [r.startAt, r.endAt] as [number, number]),
@@ -177,8 +180,8 @@ export function buildCycles(records: ProcessRecord[], processById: Map<string, P
           activeHours: Math.round(activeHours * 1000) / 1000,
           idleHours: Math.max(0, Math.round((spanHours - activeHours) * 1000) / 1000),
           steps: block.length,
-          startDate: fmtDate(new Date(cur.startAt)),
-          spansDays: fmtDate(new Date(cur.startAt)) !== fmtDate(new Date(lastActiveEndAt)),
+          startDate: block[0].date,
+          spansDays: block[0].date !== lastEndDate,
           incomplete: !next
         })
       })
