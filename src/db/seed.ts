@@ -105,7 +105,8 @@ export const EXC_PROCESSES: TemplateProcess[] = [
   { key: 'm-muck', name: '出渣' },
   { key: 'm-scale', name: '扒渣排险' },
   { key: 'm-geo', name: '超前地质预报' },
-  { key: 'm-other', name: '洞内辅助作业（排水 / 清理）' }
+  { key: 'm-other', name: '洞内辅助作业（排水 / 清理）' },
+  { key: 'm-section', name: '测量扫断面（超欠挖）' }
 ]
 
 /** 支护循环工序 */

@@ -71,7 +71,7 @@ describe('本标段项目划分模板', () => {
     ])
   })
 
-  it('开挖循环 9 道、支护循环 11 道工序，且每个工作面共用同一套', () => {
+  it('开挖循环 10 道、支护循环 11 道工序，且每个工作面共用同一套', () => {
     expect(EXC_PROCESSES.map((p) => p.name)).toEqual([
       '测量放样（爆破孔）',
       '钻孔（爆破孔）',
@@ -81,12 +81,13 @@ describe('本标段项目划分模板', () => {
       '出渣',
       '扒渣排险',
       '超前地质预报',
-      '洞内辅助作业（排水 / 清理）'
+      '洞内辅助作业（排水 / 清理）',
+      '测量扫断面（超欠挖）'
     ])
     expect(SUP_PROCESSES).toHaveLength(11)
     expect(SUP_PROCESSES[SUP_PROCESSES.length - 1]).toEqual({ key: 's-arch', name: '钢拱架安装' })
     const items = flattenItems()
-    expect(items.find((i) => i.key === 'tf-zd-exc')?.processes).toBe(9)
+    expect(items.find((i) => i.key === 'tf-zd-exc')?.processes).toBe(10)
     expect(items.find((i) => i.key === 'tf-zd-sup')?.processes).toBe(11)
   })
 

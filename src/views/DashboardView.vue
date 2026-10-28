@@ -22,6 +22,7 @@ import {
   type PeriodRange
 } from '@/core/compute'
 import { buildDayRing } from '@/core/dayRing'
+import { CYCLE_FAMILIES, buildCycles, cyclesInPeriod, summarizeCycles } from '@/core/cycles'
 import { aggregateByItem, filterByScope, shortItemLabel, stackedTrend } from '@/core/scope'
 import { GAP_TOLERANCE_MINUTES } from '@/core/reasons'
 import {
@@ -241,6 +242,99 @@ const inRange = computed(() =>
 
 const procAgg = computed(() => aggregateByProcess(inRange.value, processById.value, wbsById.value))
 const itemAgg = computed(() => aggregateByItem(inRange.value, processById.value, wbsById.value))
+
+// ------------------------------------------------------- 循环用时（开挖 / 支护）
+const allCycles = computed(() => buildCycles(scopeRecords.value, processById.value))
+const periodCycles = computed(() => cyclesInPeriod(allCycles.value, range.value.from, range.value.to))
+const excCycle = computed(() => summarizeCycles(periodCycles.value, 'exc'))
+const supCycle = computed(() => summarizeCycles(periodCycles.value, 'sup'))
+
+function cycleHint(s: { count: number; avgHours: number; spanning: number; incomplete: number }): string {
+  if (!s.count) return '本期无完整循环'
+  const bits = [`${s.count} 轮`, `平均 ${fmtHoursShort(s.avgHours)}`]
+  if (s.spanning) bits.push(`跨天 ${s.spanning}`)
+  if (s.incomplete) bits.push(`未完 ${s.incomplete}`)
+  return bits.join(' · ')
+}
+
+function fmtTs(ts: number): string {
+  const d = new Date(ts)
+  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${String(
+    d.getHours()
+  ).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+}
+
+/** 图里最多画最近 12 轮；编号按所选周期内的全部轮次算，避免月份视图编号跳 */
+const cycleChart = computed(() => {
+  const counter = new Map<string, number>()
+  const labeled = periodCycles.value.map((c) => {
+    const cfg = CYCLE_FAMILIES[c.family]
+    const k = `${c.startDate}-${c.family}`
+    const n = (counter.get(k) ?? 0) + 1
+    counter.set(k, n)
+    return { ...c, label: `${c.startDate.slice(5)} ${cfg.label}#${n}`, color: cfg.color }
+  })
+  const shown = labeled.slice(-12)
+  const rest = labeled.slice(0, Math.max(0, labeled.length - 12))
+  return {
+    rows: shown.reverse(),
+    restCount: rest.length,
+    restHours: rest.reduce((s, c) => s + c.activeHours, 0)
+  }
+})
+
+const cycleChartOption = computed<EChartsOption>(() => {
+  const rows = cycleChart.value.rows
+  return {
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (params: unknown) => {
+        const arr = params as Array<{ dataIndex: number }>
+        const row = rows[arr[0]?.dataIndex ?? 0]
+        if (!row) return ''
+        return [
+          `<b>${row.label}</b>`,
+          `${fmtTs(row.startAt)} → ${fmtTs(row.boundaryEndAt)}${row.incomplete ? '（截至数据末）' : '（下一轮起点）'}`,
+          `作业 ${row.activeHours.toFixed(1)}h · 轮内停工 ${row.idleHours.toFixed(1)}h 已剔除`,
+          `${row.steps} 条记录${row.spansDays ? ' · 跨天作业' : ''}`
+        ].join('<br/>')
+      }
+    },
+    grid: { left: 96, right: 54, top: 8, bottom: 22 },
+    xAxis: {
+      type: 'value',
+      name: 'h',
+      nameTextStyle: { fontSize: 9, color: '#8b95a1' },
+      axisLabel: { fontSize: 9, color: '#8b95a1' },
+      splitLine: { lineStyle: { color: '#f2f3f5' } }
+    },
+    yAxis: {
+      type: 'category',
+      data: rows.map((r) => r.label),
+      axisLabel: { fontSize: 9, color: '#4a5461' }
+    },
+    series: [
+      {
+        type: 'bar',
+        barMaxWidth: 12,
+        data: rows.map((r) => ({ value: Number(r.activeHours.toFixed(2)), itemStyle: { color: r.color } })),
+        label: {
+          show: true,
+          position: 'right',
+          fontSize: 8,
+          color: '#4a5461',
+          formatter: (p: unknown) => {
+            const idx = (p as { dataIndex: number }).dataIndex
+            const r = rows[idx]
+            if (!r) return ''
+            return `${r.activeHours.toFixed(1)}h${r.spansDays ? ' 跨天' : ''}${r.incomplete ? ' 未完' : ''}`
+          }
+        }
+      }
+    ]
+  } as EChartsOption
+})
 
 /** 24 小时圆盘：只在"日"模式用，数据就是当天范围内的记录 */
 const dayRing = computed(() =>
@@ -654,6 +748,16 @@ onMounted(() => {
         :hint="`占周期 ${(gapRatio * 100).toFixed(1)}% · ${stats.gapCount} 处`"
       />
       <StatCard
+        label="开挖循环总用时"
+        :value="excCycle.count ? fmtHoursShort(excCycle.totalHours) : '—'"
+        :hint="cycleHint(excCycle)"
+      />
+      <StatCard
+        label="支护循环总用时"
+        :value="supCycle.count ? fmtHoursShort(supCycle.totalHours) : '—'"
+        :hint="cycleHint(supCycle)"
+      />
+      <StatCard
         label="工时环比"
         :value="hoursDelta === null ? '—' : `${hoursDelta >= 0 ? '+' : ''}${(hoursDelta * 100).toFixed(1)}%`"
         :hint="`上期 ${fmtHoursShort(prevStats.actualHours)}`"
@@ -671,6 +775,22 @@ onMounted(() => {
     </div>
     <div v-if="exceedPeriods.length" class="card tip-card warn">
       有 {{ exceedPeriods.length }} 天单日工时超过 24 小时（图中日期标红），可能是同一天有重复或重叠记录，建议到明细页核对。
+    </div>
+
+    <div class="card">
+      <div class="card-title">
+        循环用时（开挖 / 支护）
+        <span class="sub">每轮作业用时 · 已剔除 &gt;6h 停工</span>
+      </div>
+      <ChartBox
+        v-if="cycleChart.rows.length"
+        :option="cycleChartOption"
+        :height="Math.max(180, cycleChart.rows.length * 34 + 50)"
+      />
+      <van-empty v-else description="本期没有完整循环" image-size="60" />
+      <div v-if="cycleChart.restCount" class="muted" style="margin-top: 6px; text-align: right">
+        另有 {{ cycleChart.restCount }} 轮（合计 {{ fmtHoursShort(cycleChart.restHours) }}）未画出
+      </div>
     </div>
 
     <div v-if="periodType === 'day'" class="card">
