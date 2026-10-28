@@ -16,8 +16,12 @@ import {
   setProjectArchived
 } from '@/db'
 import { suggestStandardHours } from '@/core/compute'
+import {
+  filterStandardHoursRows,
+  type StandardHoursFilter
+} from '@/core/standardFilter'
 import { HISTORY_ROWS } from '@/db/history'
-import type { Process, WbsLevel } from '@/types'
+import type { Process, WbsLevel, WbsNode } from '@/types'
 import { fmtHoursShort } from '@/core/time'
 
 const tab = ref<'structure' | 'standard'>('structure')
@@ -283,17 +287,27 @@ watch(
   () => state.currentProjectId,
   () => {
     void loadHistoryCount()
+    clearStandardFilter()
   }
 )
 
 // -------------------------------------------------------------- 标准用时
 const standardDrafts = reactive<Record<string, string>>({})
+const standardFilter = reactive<StandardHoursFilter>({
+  query: '',
+  unitId: '',
+  divisionId: '',
+  itemId: ''
+})
+type StandardPickerLevel = '' | 'unit' | 'division' | 'item'
+const standardPickerLevel = ref<StandardPickerLevel>('')
 
-const standardRows = computed(() =>
+const allStandardRows = computed(() =>
   state.processes
     .map((p) => {
       const item = state.wbs.find((w) => w.id === p.itemId)
       const div = item?.parentId ? state.wbs.find((w) => w.id === item.parentId) : undefined
+      const unit = div?.parentId ? state.wbs.find((w) => w.id === div.parentId) : undefined
       const local = suggestStandardHours(p.id, state.records)
       // 优先用模板里预置的实测参考用时；没有时用本机已有记录的平均值
       // 参考用时优先用模板预置的实测统计；没有时用本机记录的平均值，但同样要求样本 ≥ 5 次
@@ -308,10 +322,115 @@ const standardRows = computed(() =>
         : localUsable !== null
           ? `本机 ${local.sample} 条记录平均 ${fmtHoursShort(localUsable)}`
           : ''
-      return { process: p, itemName: item?.name ?? '', divisionName: div?.name ?? '', refValue, refText }
+      return {
+        process: p,
+        unitId: unit?.id ?? '',
+        unitName: unit?.name ?? '未归单位',
+        divisionId: div?.id ?? '',
+        divisionName: div?.name ?? '未归分部',
+        itemId: item?.id ?? p.itemId,
+        itemName: item?.name ?? '未知分项',
+        processName: p.name,
+        refValue,
+        refText
+      }
     })
-    .sort((a, b) => (a.divisionName + a.itemName + a.process.name).localeCompare(b.divisionName + b.itemName + b.process.name, 'zh'))
+    .sort((a, b) =>
+      (a.unitName + a.divisionName + a.itemName + a.processName).localeCompare(
+        b.unitName + b.divisionName + b.itemName + b.processName,
+        'zh'
+      )
+    )
 )
+
+const standardRows = computed(() => filterStandardHoursRows(allStandardRows.value, standardFilter))
+
+const standardDivisions = computed(() =>
+  standardFilter.unitId ? childrenOf(standardFilter.unitId, 2) : []
+)
+
+const standardItems = computed<WbsNode[]>(() => {
+  if (standardFilter.divisionId) return childrenOf(standardFilter.divisionId, 3)
+  if (!standardFilter.unitId) return []
+  const divisionIds = new Set(childrenOf(standardFilter.unitId, 2).map((d) => d.id))
+  return state.wbs
+    .filter((w) => w.level === 3 && w.parentId !== null && divisionIds.has(w.parentId))
+    .sort((a, b) => a.sort - b.sort)
+})
+
+const standardPickerTitle = computed(() => {
+  if (standardPickerLevel.value === 'unit') return '选择单位工程'
+  if (standardPickerLevel.value === 'division') return '选择分部工程'
+  if (standardPickerLevel.value === 'item') return '选择分项工程'
+  return ''
+})
+
+const showStandardPicker = computed({
+  get: () => standardPickerLevel.value !== '',
+  set: (show: boolean) => {
+    if (!show) standardPickerLevel.value = ''
+  }
+})
+
+const standardPickerSelectedId = computed(() => {
+  if (standardPickerLevel.value === 'unit') return standardFilter.unitId
+  if (standardPickerLevel.value === 'division') return standardFilter.divisionId
+  if (standardPickerLevel.value === 'item') return standardFilter.itemId
+  return ''
+})
+
+const standardPickerAllLabel = computed(() => {
+  if (standardPickerLevel.value === 'unit') return '全部单位工程'
+  if (standardPickerLevel.value === 'division') return '全部分部工程'
+  if (standardPickerLevel.value === 'item') return '全部分项工程'
+  return '全部'
+})
+
+const standardPickerOptions = computed<WbsNode[]>(() => {
+  if (standardPickerLevel.value === 'unit') return units.value
+  if (standardPickerLevel.value === 'division') return standardDivisions.value
+  if (standardPickerLevel.value === 'item') return standardItems.value
+  return []
+})
+
+const standardUnitLabel = computed(
+  () => state.wbs.find((w) => w.id === standardFilter.unitId)?.name ?? '全部单位工程'
+)
+const standardDivisionLabel = computed(
+  () => state.wbs.find((w) => w.id === standardFilter.divisionId)?.name ?? '全部分部工程'
+)
+const standardItemLabel = computed(
+  () => state.wbs.find((w) => w.id === standardFilter.itemId)?.name ?? '全部分项工程'
+)
+const standardHasScope = computed(() =>
+  Boolean(standardFilter.unitId || standardFilter.divisionId || standardFilter.itemId)
+)
+const standardHasFilter = computed(() => standardHasScope.value || Boolean(standardFilter.query.trim()))
+
+function openStandardPicker(level: Exclude<StandardPickerLevel, ''>) {
+  standardPickerLevel.value = level
+}
+
+function chooseStandardFilter(id: string) {
+  if (standardPickerLevel.value === 'unit') {
+    standardFilter.unitId = id
+    standardFilter.divisionId = ''
+    standardFilter.itemId = ''
+  } else if (standardPickerLevel.value === 'division') {
+    standardFilter.divisionId = id
+    standardFilter.itemId = ''
+  } else if (standardPickerLevel.value === 'item') {
+    standardFilter.itemId = id
+  }
+  standardPickerLevel.value = ''
+}
+
+function clearStandardFilter() {
+  standardFilter.query = ''
+  standardFilter.unitId = ''
+  standardFilter.divisionId = ''
+  standardFilter.itemId = ''
+}
 
 function draftValue(p: Process): string {
   if (standardDrafts[p.id] !== undefined) return standardDrafts[p.id]
@@ -338,7 +457,7 @@ function adoptAllRefHours() {
 
 async function resetAllStandards() {
   await showConfirmDialog({ title: '清空标准用时', message: '将把所有工序的标准用时清空（参考用时不受影响），确定吗？' })
-  standardRows.value.forEach((row) => {
+  allStandardRows.value.forEach((row) => {
     standardDrafts[row.process.id] = ''
   })
   showToast('已清空，记得点“保存标准用时”')
@@ -478,6 +597,42 @@ async function saveStandards() {
     </template>
 
     <template v-else>
+      <div class="card standard-filter-card" style="margin-top: 12px">
+        <van-search
+          v-model="standardFilter.query"
+          shape="round"
+          placeholder="搜索工序、分项、分部或单位工程"
+        />
+        <van-field
+          :model-value="standardUnitLabel"
+          label="单位工程"
+          readonly
+          is-link
+          @click="openStandardPicker('unit')"
+        />
+        <van-field
+          :model-value="standardDivisionLabel"
+          label="分部工程"
+          :placeholder="standardFilter.unitId ? '全部分部工程' : '请先选单位工程'"
+          readonly
+          is-link
+          :disabled="!standardFilter.unitId"
+          @click="openStandardPicker('division')"
+        />
+        <van-field
+          :model-value="standardItemLabel"
+          label="分项工程"
+          :placeholder="standardFilter.unitId ? '全部分项工程' : '请先选单位工程'"
+          readonly
+          is-link
+          :disabled="!standardFilter.unitId"
+          @click="openStandardPicker('item')"
+        />
+        <div class="row-between standard-filter-foot">
+          <span class="muted">显示 {{ standardRows.length }} / {{ allStandardRows.length }} 道工序</span>
+          <span v-if="standardHasFilter" class="clear-filter" @click="clearStandardFilter">清除范围</span>
+        </div>
+      </div>
       <div class="card" style="margin-top: 12px">
         <div class="muted">
           标准用时留着由你确认：<b>参考用时</b>是三份循环作业记录实测出来的中位数（样本少于 5 次的不给参考值），
@@ -485,9 +640,9 @@ async function saveStandards() {
         </div>
         <div class="btn-row">
           <van-button size="small" type="primary" plain @click="adoptAllRefHours">
-            全部采用参考用时（{{ refCount }} 道）
+            采用当前范围参考用时（{{ refCount }} 道）
           </van-button>
-          <van-button size="small" plain @click="resetAllStandards">清空标准用时</van-button>
+          <van-button size="small" plain @click="resetAllStandards">清空全部标准用时</van-button>
         </div>
       </div>
       <div class="card">
@@ -509,13 +664,46 @@ async function saveStandards() {
             @update:model-value="(v: string) => (standardDrafts[row.process.id] = v)"
           />
         </div>
-        <van-empty v-if="!standardRows.length" description="当前项目还没有工序" image-size="60" />
+        <van-empty
+          v-if="!standardRows.length"
+          :description="standardHasFilter ? '当前搜索或范围内没有工序' : '当前项目还没有工序'"
+          image-size="60"
+        />
       </div>
       <van-button block type="primary" round @click="saveStandards">保存标准用时</van-button>
     </template>
 
     <div class="bottom-space" />
   </div>
+
+  <van-popup v-model:show="showStandardPicker" round position="bottom" :style="{ maxHeight: '70%' }">
+    <div class="standard-picker">
+      <div class="standard-picker-head">
+        <b>{{ standardPickerTitle }}</b>
+        <span class="muted" @click="standardPickerLevel = ''">关闭</span>
+      </div>
+      <div class="standard-picker-body">
+        <div class="standard-picker-item all" @click="chooseStandardFilter('')">
+          <span>{{ standardPickerAllLabel }}</span>
+          <van-icon v-if="!standardPickerSelectedId" name="success" color="#1f6feb" />
+        </div>
+        <div
+          v-for="opt in standardPickerOptions"
+          :key="opt.id"
+          class="standard-picker-item"
+          @click="chooseStandardFilter(opt.id)"
+        >
+          <span>{{ opt.name }}</span>
+          <van-icon
+            v-if="standardPickerSelectedId === opt.id"
+            name="success"
+            color="#1f6feb"
+          />
+        </div>
+        <van-empty v-if="!standardPickerOptions.length" description="没有可选项" image-size="60" />
+      </div>
+    </div>
+  </van-popup>
 
   <van-popup v-model:show="editor.show" round position="bottom" :style="{ paddingBottom: '16px' }">
     <div style="padding: 16px">
@@ -572,6 +760,52 @@ async function saveStandards() {
 </template>
 
 <style scoped>
+.standard-filter-card {
+  padding: 4px 0 10px;
+}
+
+.standard-filter-foot {
+  padding: 8px 16px 0;
+}
+
+.clear-filter {
+  color: #1f6feb;
+  font-size: 12px;
+}
+
+.standard-picker {
+  padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+}
+
+.standard-picker-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px;
+  border-bottom: 1px solid #f0f2f5;
+}
+
+.standard-picker-body {
+  max-height: 58vh;
+  overflow-y: auto;
+  padding: 0 16px;
+}
+
+.standard-picker-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 2px;
+  border-bottom: 1px solid #f4f5f7;
+  font-size: 14px;
+}
+
+.standard-picker-item.all {
+  color: #33404f;
+  font-weight: 600;
+}
+
 .btn-row {
   display: flex;
   gap: 8px;

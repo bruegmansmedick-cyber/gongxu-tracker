@@ -3,13 +3,19 @@ import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { afterChange, state } from '@/store'
-import { deleteRecord as removeRecord, getKv, getRecord, saveProcess, saveRecord, setKv } from '@/db'
+import { deleteRecord as removeRecord, delKv, getKv, getRecord, saveProcess, saveRecord, setKv } from '@/db'
 import { buildTimeFields, suggestStandardHours } from '@/core/compute'
 import { checkBeforeSave } from '@/core/health'
 import { parseChainageRange } from '@/core/chainage'
 import { GAP_REASONS, MAX_CUSTOM_REASONS, mergeCustomReasons } from '@/core/reasons'
 import { recommendProcesses, rememberProcess, type ProcessMemory } from '@/core/recommend'
 import { buildUsageIndex, predictSelection, rankByUsage } from '@/core/predict'
+import {
+  RECORD_DRAFT_KEY,
+  isRecordDraft,
+  makeRecordDraft,
+  type RecordDraftInput
+} from '@/core/recordDraft'
 import { addDays, fmtDate, fmtHours, friendlyDate, nowHhmm, parseLooseTime, todayStr } from '@/core/time'
 import type { Process, WbsLevel, WbsNode } from '@/types'
 
@@ -37,6 +43,8 @@ const location = ref('')
 const locationError = ref('')
 const note = ref('')
 const saving = ref(false)
+/** 当前本机草稿的暂存时间；0 表示本次表单没有恢复/保存草稿 */
+const draftSavedAt = ref(0)
 
 const showCalendar = ref(false)
 const showReasonPicker = ref(false)
@@ -190,6 +198,13 @@ const historyHint = computed(() => {
   const s = suggestStandardHours(processId.value, state.records)
   if (!s.value) return ''
   return `历史平均 ${fmtHours(s.value)}（${s.sample} 条记录）`
+})
+
+const draftSavedLabel = computed(() => {
+  if (!draftSavedAt.value) return ''
+  const d = new Date(draftSavedAt.value)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
 })
 
 function openPicker(level: 'unit' | 'division' | 'item') {
@@ -469,6 +484,94 @@ async function submitReason() {
   showToast(`已新增原因：${text}`)
 }
 
+function draftSnapshot(): RecordDraftInput {
+  return {
+    projectId: state.currentProjectId,
+    unitId: unitId.value,
+    divisionId: divisionId.value,
+    itemId: itemId.value,
+    processId: processId.value,
+    date: date.value,
+    startTime: startTime.value,
+    endTime: endTime.value,
+    startInput: startInput.value,
+    endInput: endInput.value,
+    quantity: quantity.value,
+    gapReason: gapReason.value,
+    location: location.value,
+    note: note.value
+  }
+}
+
+/** 只暂存到本机 IndexedDB；刷新、离开页面后再回来仍能恢复。 */
+async function saveDraft() {
+  if (recordId.value) return
+  if (!state.currentProjectId) {
+    showToast('请先选择项目')
+    return
+  }
+  const savedAt = Date.now()
+  try {
+    await setKv(RECORD_DRAFT_KEY, makeRecordDraft(draftSnapshot(), savedAt))
+    draftSavedAt.value = savedAt
+    showToast('已暂存本机，刷新后仍可继续填写')
+  } catch {
+    showToast('暂存失败，请稍后再试')
+  }
+}
+
+async function removeStoredDraft() {
+  await delKv(RECORD_DRAFT_KEY)
+  draftSavedAt.value = 0
+}
+
+async function discardDraft() {
+  try {
+    await showConfirmDialog({
+      title: '清除暂存',
+      message: '只会清除本机保存的草稿，当前页面填写的内容仍保留。确定清除吗？',
+      confirmButtonText: '清除'
+    })
+  } catch {
+    return
+  }
+  await removeStoredDraft()
+  showToast('暂存已清除')
+}
+
+async function restoreDraft() {
+  const raw = await getKv<unknown>(RECORD_DRAFT_KEY, null)
+  if (!isRecordDraft(raw) || raw.projectId !== state.currentProjectId) return
+
+  const processApplied = raw.processId ? applyProcess(raw.processId) : false
+  if (!processApplied) {
+    const savedUnit = wbsById.value.get(raw.unitId)
+    if (savedUnit?.level === 1 && savedUnit.projectId === state.currentProjectId) unitId.value = savedUnit.id
+    const savedDivision = wbsById.value.get(raw.divisionId)
+    if (savedDivision?.level === 2 && savedDivision.parentId === unitId.value) {
+      divisionId.value = savedDivision.id
+    }
+    const savedItem = wbsById.value.get(raw.itemId)
+    if (savedItem?.level === 3 && savedItem.parentId === divisionId.value) itemId.value = savedItem.id
+  }
+
+  date.value = raw.date || todayStr()
+  startTime.value = raw.startTime || '08:00'
+  endTime.value = raw.endTime || '12:00'
+  // 完工时刻允许先留空，恢复时不能被默认 12:00 偷偷补回去。
+  startInput.value = raw.startInput
+  endInput.value = raw.endInput
+  timeInvalid.start = false
+  timeInvalid.end = false
+  quantity.value = raw.quantity
+  gapReason.value = raw.gapReason || 'none'
+  location.value = raw.location
+  locationError.value = ''
+  note.value = raw.note
+  draftSavedAt.value = raw.savedAt
+  showToast('已恢复上次暂存')
+}
+
 async function save() {
   if (!processId.value) {
     if (itemId.value) showProcessSheet.value = true
@@ -545,6 +648,7 @@ async function save() {
       operatorName: op?.name ?? '未署名'
     })
     await afterChange('records')
+    if (!recordId.value) await removeStoredDraft()
     const isToday = date.value === todayStr()
     if (recordId.value) {
       showToast('已保存修改')
@@ -629,6 +733,7 @@ async function loadFromQuery() {
   location.value = ''
   locationError.value = ''
   note.value = ''
+  draftSavedAt.value = 0
 
   if (pid) {
     if (!applyProcess(pid)) pendingProcessId.value = pid
@@ -660,6 +765,9 @@ async function loadFromQuery() {
   }
   startInput.value = startTime.value
   endInput.value = endTime.value
+
+  // 从首页直接新记时才恢复草稿；从常用工序等带参数进入时以这次选择为准。
+  if (!id && !pid && !wantedItem && !d) await restoreDraft()
 }
 
 watch(
@@ -679,6 +787,13 @@ onMounted(() => {
   <van-nav-bar :title="recordId ? '修改工序记录' : '记录工序用时'" left-arrow fixed placeholder @click-left="router.back()" />
 
   <div class="page">
+    <div v-if="draftSavedAt && !recordId" class="draft-banner">
+      <div>
+        <b>已暂存</b>
+        <span>{{ draftSavedLabel }} · 本机保存，正式保存后会清除</span>
+      </div>
+      <van-button size="mini" plain type="primary" @click="discardDraft">清除</van-button>
+    </div>
     <van-cell-group inset>
       <van-field
         :model-value="unit?.name ?? ''"
@@ -834,6 +949,7 @@ onMounted(() => {
 
   <div class="footer-bar">
     <van-button v-if="recordId" type="danger" plain @click="remove">删除</van-button>
+    <van-button v-else plain type="primary" @click="saveDraft">暂存</van-button>
     <van-button type="primary" round :loading="saving" @click="save">保存记录</van-button>
   </div>
 
@@ -1007,6 +1123,26 @@ onMounted(() => {
 </template>
 
 <style scoped>
+.draft-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border: 1px solid #cfe0ff;
+  border-radius: 12px;
+  background: #eef3ff;
+  color: #24539b;
+  font-size: 13px;
+  line-height: 1.45;
+}
+
+.draft-banner span {
+  margin-left: 6px;
+  color: #62789a;
+}
+
 .hint {
   margin: 10px 16px 0;
   font-size: 12px;
