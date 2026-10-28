@@ -22,7 +22,7 @@ import {
   type PeriodRange
 } from '@/core/compute'
 import { buildDayRing } from '@/core/dayRing'
-import { CYCLE_FAMILIES, buildCycles, cyclesInPeriod, summarizeCycles } from '@/core/cycles'
+import { CYCLE_FAMILIES, buildCycles, cycleChainageText, cyclesInPeriod, summarizeCycles } from '@/core/cycles'
 import { aggregateByItem, filterByScope, shortItemLabel, stackedTrend } from '@/core/scope'
 import { GAP_TOLERANCE_MINUTES } from '@/core/reasons'
 import {
@@ -269,10 +269,16 @@ const cycleChart = computed(() => {
   const counter = new Map<string, number>()
   const labeled = periodCycles.value.map((c) => {
     const cfg = CYCLE_FAMILIES[c.family]
-    const k = `${c.startDate}-${c.family}`
+    const itemName = wbsById.value.get(c.itemId)?.name ?? cfg.label
+    const k = `${c.startDate}-${c.family}-${c.itemId}`
     const n = (counter.get(k) ?? 0) + 1
     counter.set(k, n)
-    return { ...c, label: `${c.startDate.slice(5)} ${cfg.label}#${n}`, color: cfg.color }
+    return {
+      ...c,
+      itemName,
+      label: `${c.startDate.slice(5)} ${shortItemLabel(itemName)}#${n}`,
+      color: cfg.color
+    }
   })
   const shown = labeled.slice(-12)
   const rest = labeled.slice(0, Math.max(0, labeled.length - 12))
@@ -293,15 +299,19 @@ const cycleChartOption = computed<EChartsOption>(() => {
         const arr = params as Array<{ dataIndex: number }>
         const row = rows[arr[0]?.dataIndex ?? 0]
         if (!row) return ''
-        return [
+        const lines = [
           `<b>${row.label}</b>`,
+          `工作面：${row.itemName}`,
           `${fmtTs(row.startAt)} → ${fmtTs(row.boundaryEndAt)}${row.incomplete ? '（截至数据末）' : '（下一轮起点）'}`,
           `作业 ${row.activeHours.toFixed(1)}h · 轮内停工 ${row.idleHours.toFixed(1)}h 已剔除`,
           `${row.steps} 条记录${row.spansDays ? ' · 跨天作业' : ''}`
-        ].join('<br/>')
+        ]
+        const chainLine = cycleChainageText(row)
+        if (chainLine) lines.push(chainLine)
+        return lines.join('<br/>')
       }
     },
-    grid: { left: 96, right: 54, top: 8, bottom: 22 },
+    grid: { left: 120, right: 54, top: 8, bottom: 22 },
     xAxis: {
       type: 'value',
       name: 'h',
@@ -748,6 +758,11 @@ onMounted(() => {
         :hint="`占周期 ${(gapRatio * 100).toFixed(1)}% · ${stats.gapCount} 处`"
       />
       <StatCard
+        label="工时环比"
+        :value="hoursDelta === null ? '—' : `${hoursDelta >= 0 ? '+' : ''}${(hoursDelta * 100).toFixed(1)}%`"
+        :hint="`上期 ${fmtHoursShort(prevStats.actualHours)}`"
+      />
+      <StatCard
         label="开挖循环总用时"
         :value="excCycle.count ? fmtHoursShort(excCycle.totalHours) : '—'"
         :hint="cycleHint(excCycle)"
@@ -756,11 +771,6 @@ onMounted(() => {
         label="支护循环总用时"
         :value="supCycle.count ? fmtHoursShort(supCycle.totalHours) : '—'"
         :hint="cycleHint(supCycle)"
-      />
-      <StatCard
-        label="工时环比"
-        :value="hoursDelta === null ? '—' : `${hoursDelta >= 0 ? '+' : ''}${(hoursDelta * 100).toFixed(1)}%`"
-        :hint="`上期 ${fmtHoursShort(prevStats.actualHours)}`"
       />
     </div>
 

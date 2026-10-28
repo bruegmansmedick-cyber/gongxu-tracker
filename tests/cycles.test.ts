@@ -1,11 +1,19 @@
 import { describe, expect, it } from 'vitest'
-import { buildCycles, cyclesInPeriod, summarizeCycles, CYCLE_IDLE_GAP_HOURS } from '@/core/cycles'
+import { buildCycles, cycleChainageText, cyclesInPeriod, summarizeCycles, CYCLE_IDLE_GAP_HOURS } from '@/core/cycles'
 import type { Process, ProcessRecord } from '@/types'
 
 const T = (s: string) => new Date(`${s}+08:00`).getTime()
 const ITEM = 'wbs-p-i1'
 
-function rec(id: string, key: string, start: string, end: string, note = '', item = ITEM): ProcessRecord {
+function rec(
+  id: string,
+  key: string,
+  start: string,
+  end: string,
+  note = '',
+  item = ITEM,
+  location = ''
+): ProcessRecord {
   const pid = `prc-p-${item}--${key}`
   return {
     id,
@@ -18,6 +26,7 @@ function rec(id: string, key: string, start: string, end: string, note = '', ite
     endAt: T(end),
     hours: (T(end) - T(start)) / 3600000,
     note,
+    location: location || undefined,
     operatorId: 'op',
     operatorName: '白班',
     deviceId: 'dev',
@@ -139,6 +148,31 @@ describe('循环识别', () => {
     ])
     expect(cycles).toHaveLength(2)
     expect(cycles[1].startAt).toBe(T('2026-10-11T17:00'))
+  })
+
+  it('支护轮带上桩号、合并长度与每米用时', () => {
+    const cycles = run([
+      rec('s1', 's-survey', '2026-10-10T08:00', '2026-10-10T09:00', '', ITEM, '0+459~0+462'),
+      rec('s2', 's-shot', '2026-10-10T10:00', '2026-10-10T12:00', '', ITEM, 'K0+460~0+464')
+    ])
+    expect(cycles).toHaveLength(1)
+    expect(cycles[0].family).toBe('sup')
+    expect(cycles[0].chainages).toEqual(['0+459~0+464'])
+    expect(cycles[0].chainageLengthM).toBeCloseTo(5, 3)
+    // 08-09 + 10-12 之间 1h 属短衔接，合并成 08-12 共 4h，5m → 0.8h/m
+    expect(cycles[0].hoursPerMeter).toBeCloseTo(0.8, 3)
+    expect(cycleChainageText(cycles[0])).toBe('桩号 0+459~0+464（5.0m）· 0.80h/m')
+  })
+
+  it('没有桩号时长度和每米用时为空', () => {
+    const cycles = run([
+      rec('s1', 's-survey', '2026-10-10T08:00', '2026-10-10T09:00'),
+      rec('s2', 's-shot', '2026-10-10T10:00', '2026-10-10T12:00')
+    ])
+    expect(cycles[0].chainages).toEqual([])
+    expect(cycles[0].chainageLengthM).toBeNull()
+    expect(cycles[0].hoursPerMeter).toBeNull()
+    expect(cycleChainageText(cycles[0])).toBe('桩号未填（可到明细补填）')
   })
 })
 

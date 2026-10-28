@@ -6,6 +6,7 @@ import { afterChange, state } from '@/store'
 import { deleteRecord as removeRecord, getKv, getRecord, saveProcess, saveRecord, setKv } from '@/db'
 import { buildTimeFields, suggestStandardHours } from '@/core/compute'
 import { checkBeforeSave } from '@/core/health'
+import { parseChainageRange } from '@/core/chainage'
 import { GAP_REASONS, MAX_CUSTOM_REASONS, mergeCustomReasons } from '@/core/reasons'
 import { recommendProcesses, rememberProcess, type ProcessMemory } from '@/core/recommend'
 import { buildUsageIndex, predictSelection, rankByUsage } from '@/core/predict'
@@ -33,6 +34,7 @@ const timeInvalid = reactive({ start: false, end: false })
 const quantity = ref<string>('')
 const gapReason = ref('none')
 const location = ref('')
+const locationError = ref('')
 const note = ref('')
 const saving = ref(false)
 
@@ -92,6 +94,31 @@ const unit = computed(() => wbsById.value.get(unitId.value))
 const division = computed(() => wbsById.value.get(divisionId.value))
 const item = computed(() => wbsById.value.get(itemId.value))
 const selectedProcess = computed(() => processById.value.get(processId.value))
+/** 支护类工序（s-*）：桩号建议填写，用于看板按桩号看工作量 */
+const isSupport = computed(() => {
+  const key = selectedProcess.value?.id.split('--').pop() ?? ''
+  return key.startsWith('s-')
+})
+
+/** 支护/桩号失焦时规范化；开挖的自由文本保持原样 */
+function normalizeLocation() {
+  const text = location.value.trim()
+  if (!text) {
+    locationError.value = ''
+    return
+  }
+  const parsed = parseChainageRange(text)
+  if (parsed) {
+    location.value = parsed.text
+    locationError.value = ''
+    return
+  }
+  if (isSupport.value || text.includes('+')) {
+    locationError.value = '格式示例：0+413~0+438'
+  } else {
+    locationError.value = ''
+  }
+}
 
 /** 该分项下已有的工序（工程管理里建的、别的设备同步过来的都算） */
 const itemProcesses = computed(() =>
@@ -461,6 +488,26 @@ async function save() {
     showToast('请先改正时间格式，如 08:30')
     return
   }
+  // 支护桩号不强制，但没填/写错时提醒一次，允许先存后补
+  if (isSupport.value) {
+    const parsed = parseChainageRange(location.value)
+    if (parsed) {
+      location.value = parsed.text
+      locationError.value = ''
+    } else {
+      locationError.value = '格式示例：0+413~0+438'
+      try {
+        await showConfirmDialog({
+          title: '支护桩号未填',
+          message: '这条支护记录还没有有效桩号，建议补上后再保存，方便看板按桩号看工作量。也可以先保存，之后在明细里补填。',
+          confirmButtonText: '仍然保存',
+          cancelButtonText: '去填写'
+        })
+      } catch {
+        return
+      }
+    }
+  }
   saving.value = true
   try {
     const op = state.operators.find((o) => o.id === state.currentOperatorId)
@@ -580,6 +627,7 @@ async function loadFromQuery() {
   quantity.value = ''
   gapReason.value = 'none'
   location.value = ''
+  locationError.value = ''
   note.value = ''
 
   if (pid) {
@@ -762,7 +810,13 @@ onMounted(() => {
         placeholder="选择本条记录开工前的等待原因"
         @click="showReasonPicker = true"
       />
-      <van-field v-model="location" label="部位/桩号" placeholder="如：0+120 左侧边坡（选填）" />
+      <van-field
+        v-model="location"
+        :label="isSupport ? '支护桩号' : '部位/桩号'"
+        :placeholder="isSupport ? '如 0+413~0+438（可后补，建议填写）' : '如：0+120 左侧边坡（选填）'"
+        :error-message="locationError"
+        @blur="normalizeLocation"
+      />
       <van-field v-model="note" type="textarea" rows="2" autosize label="备注" placeholder="选填" />
     </van-cell-group>
 

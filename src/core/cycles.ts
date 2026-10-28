@@ -11,6 +11,7 @@
  * 纯函数，不读写数据库。
  */
 import { isActive } from '@/core/compute'
+import { mergeChainages } from '@/core/chainage'
 import { addDays } from '@/core/time'
 import type { ISODate, Process, ProcessRecord } from '@/types'
 
@@ -62,6 +63,12 @@ export interface Cycle {
   spansDays: boolean
   /** 最后一轮（还没有下一轮起点） */
   incomplete: boolean
+  /** 本轮记录里出现的桩号（合并后的区间） */
+  chainages: string[]
+  /** 桩号区间总长度（米）；没有有效区间时为 null */
+  chainageLengthM: number | null
+  /** 每米用时（小时/米）；没有有效长度时为 null */
+  hoursPerMeter: number | null
 }
 
 export interface CycleSummary {
@@ -170,6 +177,8 @@ export function buildCycles(records: ProcessRecord[], processById: Map<string, P
           CYCLE_IDLE_GAP_HOURS * HOUR
         )
         const spanHours = Math.max(0, (boundaryEndAt - cur.startAt) / HOUR)
+        const chain = mergeChainages(block.map((r) => r.location))
+        const chainageLengthM = chain.lengthM > 0 ? chain.lengthM : null
         cycles.push({
           id: `${family}-${itemId}-${cur.startAt}`,
           family,
@@ -182,7 +191,10 @@ export function buildCycles(records: ProcessRecord[], processById: Map<string, P
           steps: block.length,
           startDate: block[0].date,
           spansDays: block[0].date !== lastEndDate,
-          incomplete: !next
+          incomplete: !next,
+          chainages: chain.ranges,
+          chainageLengthM,
+          hoursPerMeter: chainageLengthM ? Math.round((activeHours / chainageLengthM) * 1000) / 1000 : null
         })
       })
     })
@@ -205,4 +217,16 @@ export function summarizeCycles(cycles: Cycle[], family?: CycleFamily): CycleSum
     spanning: rows.filter((c) => c.spansDays).length,
     incomplete: rows.filter((c) => c.incomplete).length
   }
+}
+
+/** tooltip 里的桩号/工作量一行：支护轮没填桩号时提示可补填 */
+export function cycleChainageText(c: Cycle): string {
+  if (c.family !== 'sup') {
+    return c.chainages.length ? `桩号 ${c.chainages.slice(0, 3).join(' / ')}` : ''
+  }
+  if (!c.chainages.length) return '桩号未填（可到明细补填）'
+  const more = c.chainages.length > 3 ? ` 等 ${c.chainages.length} 段` : ''
+  const len = c.chainageLengthM ? `（${c.chainageLengthM.toFixed(1)}m）` : ''
+  const hpm = c.hoursPerMeter ? `· ${c.hoursPerMeter.toFixed(2)}h/m` : ''
+  return `桩号 ${c.chainages.slice(0, 3).join(' / ')}${more}${len}${hpm}`
 }
