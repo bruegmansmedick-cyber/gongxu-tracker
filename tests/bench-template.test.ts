@@ -56,12 +56,14 @@ describe('本标段项目划分模板', () => {
     expect(items.find((i) => i.key === 'tf-zd-sup')?.name).toBe('支护工程（通风兼安全洞主洞）')
   })
 
-  it('只有三个工作面配了循环作业工序，其余单元工程只建结构', () => {
+  it('四个工作面配了循环作业工序，其余单元工程只建结构', () => {
     const items = flattenItems().filter((i) => i.processes > 0)
-    expect(items).toHaveLength(6)
+    expect(items).toHaveLength(8)
     expect(items.map((i) => i.key).sort()).toEqual([
       'dld-1zd-exc',
       'dld-1zd-sup',
+      'dld-2zd-exc',
+      'dld-2zd-sup',
       'dld-zst-exc',
       'dld-zst-sup',
       'tf-zd-exc',
@@ -69,7 +71,7 @@ describe('本标段项目划分模板', () => {
     ])
   })
 
-  it('开挖循环 9 道、支护循环 10 道工序，且每个工作面共用同一套', () => {
+  it('开挖循环 9 道、支护循环 11 道工序，且每个工作面共用同一套', () => {
     expect(EXC_PROCESSES.map((p) => p.name)).toEqual([
       '测量放样（爆破孔）',
       '钻孔（爆破孔）',
@@ -81,10 +83,11 @@ describe('本标段项目划分模板', () => {
       '超前地质预报',
       '洞内辅助作业（排水 / 清理）'
     ])
-    expect(SUP_PROCESSES).toHaveLength(10)
+    expect(SUP_PROCESSES).toHaveLength(11)
+    expect(SUP_PROCESSES[SUP_PROCESSES.length - 1]).toEqual({ key: 's-arch', name: '钢拱架安装' })
     const items = flattenItems()
     expect(items.find((i) => i.key === 'tf-zd-exc')?.processes).toBe(9)
-    expect(items.find((i) => i.key === 'tf-zd-sup')?.processes).toBe(10)
+    expect(items.find((i) => i.key === 'tf-zd-sup')?.processes).toBe(11)
   })
 
   it('工作面与分项工程能互相反查', () => {

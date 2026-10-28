@@ -25,6 +25,8 @@ const showCalendar = ref(false)
 /** 跳转后短暂高亮的那一天 */
 const highlight = ref('')
 const calendarValue = ref(parseDate(`${month.value}-01`))
+/** 用户主动翻过月份后，不再自动跳到"最近有记录的月份" */
+let monthTouched = false
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
@@ -132,6 +134,7 @@ async function focusDate(date: string) {
 
 /** 跳到某一天：切到它所在的月份、展开那一天、滚动定位并高亮 */
 function jumpTo(date: string) {
+  monthTouched = true
   showPicker.value = false
   month.value = monthKey(date)
   expanded.value = new Set([date])
@@ -149,6 +152,7 @@ function openCalendar() {
 }
 
 function changeMonth(delta: number) {
+  monthTouched = true
   month.value = addMonths(month.value, delta)
   expanded.value = new Set()
 }
@@ -194,6 +198,13 @@ function latestMonthWithRecords(): string {
   if (dates.some((d) => monthKey(d) === current)) return current
   return monthKey(dates.sort()[dates.length - 1])
 }
+
+// 同步在页面打开后才完成时，若当前月份还是空的，就补到最近有记录的月份
+watch([() => state.records.length, () => state.ready], () => {
+  if (monthTouched || !state.ready || !state.records.length) return
+  const has = state.records.some((r) => !r.deletedAt && monthKey(r.date) === month.value)
+  if (!has) month.value = latestMonthWithRecords()
+})
 
 onMounted(() => {
   void initFromRoute()

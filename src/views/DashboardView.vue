@@ -50,6 +50,8 @@ const anchor = ref(todayStr())
 const showPeriodPicker = ref(false)
 const showPeriodCalendar = ref(false)
 const calendarValue = ref(parseDate(todayStr()))
+/** 用户主动选过日期后，就不再自动把锚点挪到"最近有记录的一天" */
+let anchorTouched = false
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
@@ -154,8 +156,11 @@ const trendTitle = computed(() => {
 
 /** 单工作面时画 24 小时参考线，并标出超 24h 的日期 */
 const showDayLimit = computed(() => state.scope.level === 'item' && periodType.value === 'day')
+/** 只有单工作面（分项工程）时，"一天超过 24h"才是异常；全部/单位工程是多条洞并行，合计超 24h 正常 */
 const exceedPeriods = computed(() =>
-  trendStack.value.totals.map((t, i) => (periodType.value === 'day' && t > 24.01 ? i : -1)).filter((i) => i >= 0)
+  showDayLimit.value
+    ? trendStack.value.totals.map((t, i) => (t > 24.01 ? i : -1)).filter((i) => i >= 0)
+    : []
 )
 
 const trendOption = computed<EChartsOption>(() => {
@@ -432,12 +437,14 @@ const itemProgress = computed(() => completionByItem(inRange.value, processById.
 // ------------------------------------------------------- 选日期 / 选周期
 // 不再只靠左右箭头：点周期标签就能跳到任意一天、任意一月
 function move(delta: number) {
+  anchorTouched = true
   if (periodType.value === 'day') anchor.value = addDays(anchor.value, delta)
   else if (periodType.value === 'week') anchor.value = addDays(anchor.value, delta * 7)
   else anchor.value = `${addMonths(monthKey(anchor.value), delta)}-01`
 }
 
 function goToday() {
+  anchorTouched = true
   anchor.value = todayStr()
 }
 
@@ -476,11 +483,13 @@ const pickerTitle = computed(() => {
 })
 
 function pickAnchorDate(date: string) {
+  anchorTouched = true
   showPeriodPicker.value = false
   anchor.value = date
 }
 
 function pickAnchorMonth(month: string) {
+  anchorTouched = true
   showPeriodPicker.value = false
   anchor.value = `${month}-01`
 }
@@ -491,6 +500,7 @@ function openPeriodCalendar() {
 }
 
 function onPeriodCalendarConfirm(value: Date) {
+  anchorTouched = true
   showPeriodCalendar.value = false
   anchor.value = fmtDate(value)
 }
@@ -529,6 +539,8 @@ watch([periodType, anchor], () => {
 })
 
 async function initPosition() {
+  // 首次打开时同步可能还没跑完：等它落定，否则会按"空数据"默认到今天
+  await waitForSyncSettled()
   const qPeriod = typeof route.query.period === 'string' ? route.query.period : ''
   const qDate =
     typeof route.query.date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(route.query.date) ? route.query.date : ''
@@ -544,6 +556,34 @@ async function initPosition() {
     else anchor.value = latestDayWithRecords()
   }
 }
+
+function waitForSyncSettled(): Promise<void> {
+  if (state.ready && !state.sync.syncing) return Promise.resolve()
+  return new Promise((resolve) => {
+    const stop = watch(
+      [() => state.ready, () => state.sync.syncing],
+      ([ready, syncing]) => {
+        if (ready && !syncing) {
+          stop()
+          resolve()
+        }
+      }
+    )
+    window.setTimeout(() => {
+      stop()
+      resolve()
+    }, 20000)
+  })
+}
+
+// 同步在页面打开后才完成时，把仍停在"无记录的一天"的锚点挪到最近有记录的一天
+watch([() => state.records.length, () => state.ready], () => {
+  if (anchorTouched || !state.ready || !state.records.length) return
+  const hasCurrent = state.records.some((r) => !r.deletedAt && r.date === anchor.value)
+  if (hasCurrent) return
+  const latest = latestDayWithRecords()
+  if (latest !== anchor.value) anchor.value = latest
+})
 
 /**
  * 默认定位：今天有记录就看今天；今天还没记（早上刚打开、或最近停工），

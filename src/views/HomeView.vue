@@ -242,7 +242,7 @@ async function onRefresh() {
             一键建立本标段项目
           </van-button>
           <div class="muted" style="text-align: center; margin-top: 10px; line-height: 1.6">
-            自动套用《项目划分》10 个单位工程、57 道循环作业工序，<br />
+            自动套用《项目划分》10 个单位工程、80 道循环作业工序，<br />
             并补录 2026 年 9 月 {{ HISTORY_ROWS.length }} 条循环作业记录
           </div>
           <div class="muted" style="text-align: center; margin-top: 8px">

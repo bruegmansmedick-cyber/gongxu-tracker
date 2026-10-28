@@ -119,7 +119,8 @@ export const SUP_PROCESSES: TemplateProcess[] = [
   { key: 's-mesh', name: '挂钢筋网' },
   { key: 's-meshcheck', name: '网片验收' },
   { key: 's-shot', name: '喷护' },
-  { key: 's-clean', name: '清理回弹料' }
+  { key: 's-clean', name: '清理回弹料' },
+  { key: 's-arch', name: '钢拱架安装' }
 ]
 
 /** 分项工程 = 项目划分表里的一行（单元工程 + 部位） */
@@ -181,8 +182,8 @@ export const BENCH_TEMPLATE: TemplateUnit[] = [
           it('dld-1zd-exc', '土石方洞挖', '导流洞1#施工支洞', '12m/单元', EXC_PROCESSES),
           it('dld-1zd-sup', '支护工程', '导流洞1#施工支洞', '12m/单元', SUP_PROCESSES),
           it('dld-1zd-fd', '封堵混凝土', '导流洞1#施工支洞（DZ1#封堵段）', '仓 / 单元'),
-          it('dld-2zd-exc', '土石方洞挖', '导流洞2#施工支洞', '12m/单元'),
-          it('dld-2zd-sup', '支护工程', '导流洞2#施工支洞', '12m/单元'),
+          it('dld-2zd-exc', '土石方洞挖', '导流洞2#施工支洞', '12m/单元', EXC_PROCESSES),
+          it('dld-2zd-sup', '支护工程', '导流洞2#施工支洞', '12m/单元', SUP_PROCESSES),
           it('dld-2zd-fd', '封堵混凝土', '导流洞2#施工支洞（DZ2#封堵段）', '仓 / 单元'),
           it('dld-zst-exc', '土石方洞挖', '导流洞闸室交通洞', '12m/单元', EXC_PROCESSES),
           it('dld-zst-sup', '支护工程', '导流洞闸室交通洞', '12m/单元', SUP_PROCESSES)
