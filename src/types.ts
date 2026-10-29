@@ -32,6 +32,25 @@ export interface WbsNode extends Syncable {
   designQty?: number
   /** 部位（桩号）与单元工程划分原则等说明 */
   note?: string
+  /** 所属工作面；分项工程（level=3）才有，缺省时按名称自动推导 */
+  workfaceId?: string
+}
+
+/**
+ * 工作面：同一个洞室 / 部位（如"1#支洞"）下的开挖、支护等分项工程归到一起。
+ * 记录不直接挂在工作上，仍通过分项工程间接归属，历史数据不需要批量改写。
+ */
+export interface Workface extends Syncable {
+  projectId: string
+  /** 所属单位工程（WbsNode level=1） */
+  unitId: string
+  /** 工作面短名，如 "1#支洞" */
+  name: string
+  sort: number
+  /** 自动初始化时的来源说明（分项名称解析口径），便于排查 */
+  source?: string
+  /** 被合并到哪个工作面；软删除后仍可用于把旧绑定迁过去 */
+  mergedInto?: string
 }
 
 /** 工序，挂在分项工程下 */
@@ -104,6 +123,8 @@ export interface CatalogPayload {
   wbs: WbsNode[]
   processes: Process[]
   operators: Operator[]
+  /** 工作面；旧版云端目录没有这个字段，读取后由本地按名称幂等补建 */
+  workfaces?: Workface[]
 }
 
 /** 云端 records-YYYY-MM.json 的结构 */

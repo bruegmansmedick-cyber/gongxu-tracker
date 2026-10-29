@@ -5,7 +5,8 @@ import ScopePicker from '@/components/ScopePicker.vue'
 import { getKv, setKv } from '@/db'
 import { state } from '@/store'
 import { computeGapRows, daySummaries } from '@/core/compute'
-import { filterByScope } from '@/core/scope'
+import { filterByScope, scopeLabel } from '@/core/scope'
+import { buildItemWorkfaceMap } from '@/core/workface'
 import { recordChainage, shortChainageText } from '@/core/chainage'
 import { reasonLabel } from '@/core/reasons'
 import { addMonths, endOfMonth, fmtDate, fmtHoursShort, friendlyDate, monthKey, parseDate, todayStr } from '@/core/time'
@@ -31,9 +32,13 @@ let monthTouched = false
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
+const workfaceById = computed(() => new Map(state.workfaces.map((w) => [w.id, w])))
+const itemWorkface = computed(() => buildItemWorkfaceMap(state.wbs, state.workfaces))
 
 /** 先按分析范围过滤，再按月份与关键词过滤 */
-const scopeRecords = computed(() => filterByScope(state.records, state.scope, processById.value, wbsById.value))
+const scopeRecords = computed(() =>
+  filterByScope(state.records, state.scope, processById.value, wbsById.value, itemWorkface.value)
+)
 
 const from = computed(() => `${month.value}-01`)
 const to = computed(() => endOfMonth(from.value))
@@ -74,14 +79,7 @@ const filteredStats = computed(() => {
   return { count: rows.length, hours, gap, days }
 })
 
-const scopeName = computed(() => {
-  const s = state.scope
-  if (s.level === 'all') return '全部工程'
-  if (s.level === 'unit') return wbsById.value.get(s.unitId ?? '')?.name ?? ''
-  const item = wbsById.value.get(s.itemId ?? '')?.name ?? ''
-  const proc = s.processId ? processById.value.get(s.processId) : undefined
-  return proc ? `${item} · ${proc.name}` : item
-})
+const scopeName = computed(() => scopeLabel(state.scope, wbsById.value, workfaceById.value))
 
 const searching = computed(() => keyword.value.trim().length > 0)
 
@@ -165,7 +163,9 @@ function pathOf(processId: string): string {
   if (!p) return ''
   const item = wbsById.value.get(p.itemId)
   const div = item?.parentId ? wbsById.value.get(item.parentId) : undefined
-  return [div?.name, item?.name].filter(Boolean).join(' / ')
+  const face = workfaceById.value.get(itemWorkface.value.get(p.itemId) ?? '')?.name
+  // 有工作面就先显示工作面（1#支洞），否则退回分部工程名
+  return [face || div?.name, item?.name].filter(Boolean).join(' / ')
 }
 
 watch(month, (m) => {

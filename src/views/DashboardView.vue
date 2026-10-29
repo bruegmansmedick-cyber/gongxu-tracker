@@ -9,29 +9,27 @@ import ScopePicker from '@/components/ScopePicker.vue'
 import { getKv, setKv } from '@/db'
 import { state } from '@/store'
 import {
-  aggregateByProcess,
-  aggregateByReason,
-  buildTrend,
   computeGapRows,
   computeStats,
-  completionByItem,
-  monthPeriods,
-  monthsWithRecords,
   topGaps,
-  weekPeriods,
   type PeriodRange
 } from '@/core/compute'
 import { buildDayRing } from '@/core/dayRing'
 import {
   CYCLE_FAMILIES,
+  buildCombinedCycles,
   buildCycles,
-  cycleChainageLabel,
   cycleChainageText,
+  cycleLabel,
   cyclesInPeriod,
-  summarizeCycles
+  filterCyclesByChainage,
+  summarizeCycles,
+  type Cycle,
+  type CycleFamily
 } from '@/core/cycles'
-import { aggregateByItem, filterByScope, shortItemLabel, stackedTrend } from '@/core/scope'
-import { mergeChainages, recordChainage, shortChainageText } from '@/core/chainage'
+import { aggregateByWorkface, chainageOptionsOf, filterByScope, shortItemLabel, stackedTrend } from '@/core/scope'
+import { buildItemWorkfaceMap } from '@/core/workface'
+import { mergeChainages, parseChainageRange, recordChainage, shortChainageText } from '@/core/chainage'
 import { GAP_TOLERANCE_MINUTES } from '@/core/reasons'
 import {
   addDays,
@@ -41,6 +39,7 @@ import {
   fmtDate,
   fmtHoursShort,
   fmtPercent,
+  listDates,
   monthKey,
   parseDate,
   startOfMonth,
@@ -49,11 +48,15 @@ import {
 } from '@/core/time'
 
 type PeriodType = 'day' | 'week' | 'month'
+type DashTab = 'overview' | 'cycles' | 'issues'
+type CycleTab = CycleFamily | 'both'
 
 const route = useRoute()
 const router = useRouter()
 const DASHBOARD_KV = 'ui.dashboard'
 
+const tab = ref<DashTab>('overview')
+const cycleTab = ref<CycleTab>('exc')
 const periodType = ref<PeriodType>('day')
 const anchor = ref(todayStr())
 const showPeriodPicker = ref(false)
@@ -64,9 +67,28 @@ let anchorTouched = false
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
+const workfaceById = computed(() => new Map(state.workfaces.map((w) => [w.id, w])))
+const itemWorkface = computed(() => buildItemWorkfaceMap(state.wbs, state.workfaces))
 
-/** 当前分析范围内的全部记录（范围由页首选择器决定） */
-const scopeRecords = computed(() => filterByScope(state.records, state.scope, processById.value, wbsById.value))
+function faceNameOf(workfaceId: string | undefined): string {
+  return workfaceId ? workfaceById.value.get(workfaceId)?.name ?? '' : ''
+}
+
+/** 只按单位工程 / 工作面筛，不含桩号与日期：循环必须在这份完整记录上识别 */
+const baseRecords = computed(() =>
+  filterByScope(
+    state.records,
+    { level: state.scope.level, unitId: state.scope.unitId, workfaceId: state.scope.workfaceId },
+    processById.value,
+    wbsById.value,
+    itemWorkface.value
+  )
+)
+
+/** 当前分析范围内的记录（含桩号筛选） */
+const scopeRecords = computed(() =>
+  filterByScope(state.records, state.scope, processById.value, wbsById.value, itemWorkface.value)
+)
 
 function rangeOf(type: PeriodType, day: string): { from: string; to: string } {
   if (type === 'day') return { from: day, to: day }
@@ -93,15 +115,15 @@ const periodLabel = computed(() =>
   periodType.value === 'day' ? anchor.value : `${range.value.from} ~ ${range.value.to}`
 )
 
+const inRange = computed(() =>
+  scopeRecords.value.filter((r) => r.date >= range.value.from && r.date <= range.value.to)
+)
+
 const stats = computed(() => computeStats(scopeRecords.value, processById.value, range.value.from, range.value.to))
 const prevStats = computed(() =>
   computeStats(scopeRecords.value, processById.value, prevRange.value.from, prevRange.value.to)
 )
 
-const hoursDelta = computed(() => {
-  if (!prevStats.value.actualHours) return null
-  return stats.value.actualHours / prevStats.value.actualHours - 1
-})
 const efficiencyDelta = computed(() => {
   if (stats.value.totalEfficiency === null || prevStats.value.totalEfficiency === null) return null
   return stats.value.totalEfficiency - prevStats.value.totalEfficiency
@@ -121,176 +143,126 @@ const caliberText = computed(() => {
   return `${label} · ${s.baselineCovered}/${s.recordCount} 条有基准`
 })
 
-const scopeName = computed(() => {
-  const s = state.scope
-  let label = '全部工程'
-  if (s.level === 'unit') label = wbsById.value.get(s.unitId ?? '')?.name ?? ''
-  if (s.level === 'item') {
-    const item = wbsById.value.get(s.itemId ?? '')?.name ?? ''
-    const proc = s.processId ? processById.value.get(s.processId) : undefined
-    label = proc ? `${item} · ${proc.name}` : item
-  }
-  return s.chainage ? `${label} · 桩号 ${shortChainageText(s.chainage)}` : label
-})
+// ------------------------------------------------------------- 一天在干什么
+const dayRing = computed(() =>
+  buildDayRing({
+    date: anchor.value,
+    records: inRange.value,
+    processById: processById.value,
+    wbsById: wbsById.value,
+    byProcess: state.scope.level === 'workface',
+    itemWorkface: itemWorkface.value,
+    workfaceById: workfaceById.value
+  })
+)
 
-// ---------------------------------------------------------------- 周期趋势
-const trendPeriods = computed<PeriodRange[]>(() => {
-  if (periodType.value === 'day') {
-    const out: PeriodRange[] = []
-    for (let i = 13; i >= 0; i -= 1) {
-      const d = addDays(anchor.value, -i)
-      out.push({ from: d, to: d, key: d, label: d.slice(5) })
-    }
-    return out
-  }
-  if (periodType.value === 'week') return weekPeriods(anchor.value, 12)
-  return monthPeriods(monthKey(anchor.value), 12)
-})
+const dayPeriods = computed<PeriodRange[]>(() =>
+  listDates(range.value.from, range.value.to).map((d) => ({ from: d, to: d, key: d, label: d.slice(5) }))
+)
 
-const trend = computed(() => buildTrend(scopeRecords.value, processById.value, trendPeriods.value))
+const dailyStack = computed(() =>
+  stackedTrend(inRange.value, processById.value, wbsById.value, dayPeriods.value, 'workface', 6, {
+    itemWorkface: itemWorkface.value,
+    workfaceById: workfaceById.value
+  })
+)
 
-const chainagesByPeriod = computed(() =>
-  trendPeriods.value.map((period) => {
-    const values = scopeRecords.value
+/** 每天涉及的桩号，tooltip 里一并给出 */
+const dailyChainages = computed(() =>
+  dayPeriods.value.map((period) => {
+    const values = inRange.value
       .filter((r) => r.date >= period.from && r.date <= period.to)
       .map(recordChainage)
     return mergeChainages(values).ranges.map(shortChainageText)
   })
 )
 
-const trendGroupBy = computed<'item' | 'process'>(() => (state.scope.level === 'item' ? 'process' : 'item'))
-
-const trendStack = computed(() =>
-  stackedTrend(
-    scopeRecords.value,
-    processById.value,
-    wbsById.value,
-    trendPeriods.value.map((p) => ({ from: p.from, to: p.to, label: p.label })),
-    trendGroupBy.value
-  )
-)
-
-const trendTitle = computed(() => {
-  const base = periodType.value === 'day' ? '近 14 天' : periodType.value === 'week' ? '近 12 周' : '近 12 月'
-  return `${base}工时构成（${trendGroupBy.value === 'item' ? '按工作面' : '按工序'}）`
-})
-
-/** 单工作面时画 24 小时参考线，并标出超 24h 的日期 */
-const showDayLimit = computed(() => state.scope.level === 'item' && periodType.value === 'day')
-/** 只有单工作面（分项工程）时，"一天超过 24h"才是异常；全部/单位工程是多条洞并行，合计超 24h 正常 */
-const exceedPeriods = computed(() =>
-  showDayLimit.value
-    ? trendStack.value.totals.map((t, i) => (t > 24.01 ? i : -1)).filter((i) => i >= 0)
-    : []
-)
-
-const trendOption = computed<EChartsOption>(() => {
-  const stack = trendStack.value
-  const eff = trend.value
-  const series: Array<Record<string, unknown>> = stack.series.map((s, idx) => ({
+const dailyMainOption = computed<EChartsOption>(() => {
+  const stack = dailyStack.value
+  const series = stack.series.map((s) => ({
     name: s.name,
     type: 'bar',
     stack: 'hours',
     data: s.data,
-    barMaxWidth: 18,
-    emphasis: { focus: 'series' },
-    ...(idx === 0 && showDayLimit.value
-      ? {
-          markLine: {
-            silent: true,
-            symbol: 'none',
-            lineStyle: { color: '#f59e0b', type: 'dashed', width: 1 },
-            label: { formatter: '24h', fontSize: 9, color: '#b26a00' },
-            data: [{ yAxis: 24 }]
-          }
-        }
-      : {})
+    barMaxWidth: 16,
+    emphasis: { focus: 'series' }
   }))
-  series.push({
-    name: '效率',
-    type: 'line',
-    yAxisIndex: 1,
-    data: eff.map((t) => (t.totalEfficiency === null ? null : Number(t.totalEfficiency.toFixed(4)))),
-    smooth: true,
-    connectNulls: true,
-    symbolSize: 5,
-    lineStyle: { color: '#f59e0b', width: 2 },
-    itemStyle: { color: '#f59e0b' }
-  })
   return {
     tooltip: {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
       formatter: (params: unknown) => {
-        const list = params as Array<{
-          dataIndex: number
-          axisValueLabel?: string
-          marker: string
-          seriesName: string
-          value: number | string | null
-        }>
+        const list = params as Array<{ dataIndex: number; marker: string; seriesName: string; value: number }>
         const first = list[0]
         if (!first) return ''
-        const lines = [`<b>${first.axisValueLabel ?? ''}</b>`]
-        list.forEach((p) => {
-          const value =
-            p.seriesName === '效率' && p.value !== null
-              ? `${(Number(p.value) * 100).toFixed(1)}%`
-              : p.value === null
-                ? '—'
-                : `${typeof p.value === 'number' ? p.value.toFixed(2) : p.value}h`
-          lines.push(`${p.marker}${p.seriesName}：${value}`)
-        })
-        const chains = chainagesByPeriod.value[first.dataIndex] ?? []
-        if (chains.length) lines.push(`桩号：${chains.slice(0, 3).join(' / ')}${chains.length > 3 ? ' 等' : ''}`)
+        const lines = [`<b>${dayPeriods.value[first.dataIndex]?.from ?? ''}</b>`]
+        list.forEach((p) => lines.push(`${p.marker}${p.seriesName}：${Number(p.value).toFixed(1)}h`))
+        lines.push(`合计 ${Number(stack.totals[first.dataIndex] ?? 0).toFixed(1)}h`)
+        const chains = dailyChainages.value[first.dataIndex] ?? []
+        if (chains.length) lines.push(`桩号 ${chains.slice(0, 3).join(' / ')}${chains.length > 3 ? ' 等' : ''}`)
         return lines.join('<br/>')
       }
     },
     legend: { type: 'scroll', top: 0, itemHeight: 8, textStyle: { fontSize: 10 }, pageTextStyle: { fontSize: 10 } },
-    grid: { left: 38, right: 46, top: 34, bottom: 24 },
+    grid: { left: 38, right: 14, top: 34, bottom: 24 },
     xAxis: {
       type: 'category',
       data: stack.labels,
-      axisLabel: {
-        fontSize: 9,
-        color: (_value: string, index: number) =>
-          exceedPeriods.value.includes(index) ? '#d14343' : '#8b95a1'
-      },
+      axisLabel: { fontSize: 9, color: '#8b95a1' },
       axisLine: { lineStyle: { color: '#e8eaee' } }
     },
-    yAxis: [
-      {
-        type: 'value',
-        name: 'h',
-        nameTextStyle: { fontSize: 10, color: '#8b95a1' },
-        axisLabel: { fontSize: 9, color: '#8b95a1' },
-        splitLine: { lineStyle: { color: '#f2f3f5' } }
-      },
-      {
-        type: 'value',
-        name: '效率',
-        nameTextStyle: { fontSize: 10, color: '#8b95a1' },
-        axisLabel: { fontSize: 9, color: '#8b95a1', formatter: (v: number) => `${(v * 100).toFixed(0)}%` },
-        splitLine: { show: false }
-      }
-    ],
+    yAxis: {
+      type: 'value',
+      name: 'h',
+      nameTextStyle: { fontSize: 10, color: '#8b95a1' },
+      axisLabel: { fontSize: 9, color: '#8b95a1' },
+      splitLine: { lineStyle: { color: '#f2f3f5' } }
+    },
     series
   } as EChartsOption
 })
 
-// ------------------------------------------------------------ 工序 / 空隙
-const inRange = computed(() =>
-  scopeRecords.value.filter((r) => r.date >= range.value.from && r.date <= range.value.to)
+const workfaceAgg = computed(() =>
+  aggregateByWorkface(inRange.value, processById.value, wbsById.value, itemWorkface.value, workfaceById.value)
 )
 
-const procAgg = computed(() => aggregateByProcess(inRange.value, processById.value, wbsById.value))
-const itemAgg = computed(() => aggregateByItem(inRange.value, processById.value, wbsById.value))
+// ------------------------------------------------------------------ 循环
+const cycleContext = computed(() => ({
+  processById: processById.value,
+  itemWorkface: itemWorkface.value
+}))
 
-// ------------------------------------------------------- 循环用时（开挖 / 支护）
-const allCycles = computed(() => buildCycles(scopeRecords.value, processById.value))
-const periodCycles = computed(() => cyclesInPeriod(allCycles.value, range.value.from, range.value.to))
-const excCycle = computed(() => summarizeCycles(periodCycles.value, 'exc'))
-const supCycle = computed(() => summarizeCycles(periodCycles.value, 'sup'))
+/** 先在"单位工程 / 工作面"的完整记录上识别，再套桩号与日期，桩号缺失不会打断轮次边界 */
+const allCycles = computed(() => buildCycles(baseRecords.value, cycleContext.value))
+const periodCyclesAll = computed(() => cyclesInPeriod(allCycles.value, range.value.from, range.value.to))
+const periodCycles = computed(() => filterCyclesByChainage(periodCyclesAll.value, state.scope.chainage))
+const excSummary = computed(() => summarizeCycles(periodCycles.value, 'exc'))
+const supSummary = computed(() => summarizeCycles(periodCycles.value, 'sup'))
+
+/** 综合模式只在"单一工作面 + 桩号"时启用 */
+const combinedAvailable = computed(() => state.scope.level === 'workface' && Boolean(state.scope.chainage))
+const combinedResult = computed(() =>
+  combinedAvailable.value
+    ? buildCombinedCycles(
+        // 配对用未按桩号裁剪的两族循环，避免支护轮缺桩号被误判"缺支护"；桩号只筛整轮
+        periodCyclesAll.value.filter((c) => c.family === 'exc'),
+        periodCyclesAll.value.filter((c) => c.family === 'sup'),
+        state.scope.chainage
+      )
+    : null
+)
+const combinedAvgText = computed(() => {
+  const avg = combinedResult.value?.avgHours
+  return avg === null || avg === undefined ? '—' : fmtHoursShort(avg)
+})
+/** 综合视图里把某轮的日期说清楚 */
+function combinedLabel(startDate: string, endDate: string, spansDays: boolean): string {
+  return `${startDate.slice(5)}${spansDays ? `→${endDate.slice(5)}` : ''}`
+}
+
+watch(combinedAvailable, (ok) => {
+  if (!ok && cycleTab.value === 'both') cycleTab.value = 'exc'
+})
 
 function cycleHint(s: { count: number; avgHours: number; spanning: number; incomplete: number }): string {
   if (!s.count) return '本期无完整循环'
@@ -307,34 +279,41 @@ function fmtTs(ts: number): string {
   ).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
 }
 
-/** 图里最多画最近 12 轮；编号按所选周期内的全部轮次算，避免月份视图编号跳 */
-const cycleChart = computed(() => {
+interface CycleRow {
+  cycle: Cycle
+  label: string
+  faceName: string
+  color: string
+}
+
+const cycleRows = computed(() => {
+  if (cycleTab.value === 'both') return { rows: [] as CycleRow[], rest: 0, restHours: 0 }
+  const rows = periodCycles.value.filter((c) => c.family === cycleTab.value)
   const counter = new Map<string, number>()
-  const labeled = periodCycles.value.map((c) => {
-    const cfg = CYCLE_FAMILIES[c.family]
-    const itemName = wbsById.value.get(c.itemId)?.name ?? cfg.label
-    const k = `${c.startDate}-${c.family}-${c.itemId}`
-    const n = (counter.get(k) ?? 0) + 1
-    counter.set(k, n)
-    const chain = cycleChainageLabel(c)
+  const labeled: CycleRow[] = rows.map((c) => {
+    const key = `${c.startDate}-${c.workfaceId || c.itemId}-${c.family}`
+    const n = (counter.get(key) ?? 0) + 1
+    counter.set(key, n)
+    const faceName = faceNameOf(c.workfaceId)
+    const itemName = wbsById.value.get(c.itemId)?.name ?? ''
     return {
-      ...c,
-      itemName,
-      label: chain ? `${chain}\n${cfg.label}` : `${c.startDate.slice(5)} ${shortItemLabel(itemName)}#${n}`,
-      color: cfg.color
+      cycle: c,
+      label: cycleLabel(c, { workfaceName: faceName, itemName, index: n }),
+      faceName: faceName || (itemName ? shortItemLabel(itemName) : '未分工作面'),
+      color: CYCLE_FAMILIES[c.family].color
     }
   })
   const shown = labeled.slice(-12)
-  const rest = labeled.slice(0, Math.max(0, labeled.length - 12))
+  const rest = labeled.slice(0, Math.max(0, labeled.length - shown.length))
   return {
     rows: shown.reverse(),
-    restCount: rest.length,
-    restHours: rest.reduce((s, c) => s + c.activeHours, 0)
+    rest: rest.length,
+    restHours: rest.reduce((s, r) => s + r.cycle.hours, 0)
   }
 })
 
 const cycleChartOption = computed<EChartsOption>(() => {
-  const rows = cycleChart.value.rows
+  const rows = cycleRows.value.rows
   return {
     tooltip: {
       trigger: 'axis',
@@ -343,19 +322,100 @@ const cycleChartOption = computed<EChartsOption>(() => {
         const arr = params as Array<{ dataIndex: number }>
         const row = rows[arr[0]?.dataIndex ?? 0]
         if (!row) return ''
+        const c = row.cycle
         const lines = [
-          `<b>${row.label.replace('\n', ' · ')}</b>`,
-          `工作面：${row.itemName}`,
-          `时间：${fmtTs(row.startAt)} → ${fmtTs(row.boundaryEndAt)}${row.incomplete ? '（截至数据末）' : '（下一轮起点）'}`,
-          `作业 ${row.activeHours.toFixed(1)}h · 轮内停工 ${row.idleHours.toFixed(1)}h 已剔除`,
-          `${row.steps} 条记录${row.spansDays ? ' · 跨天作业' : ''}`
+          `<b>${row.label}</b>`,
+          `工作面：${row.faceName}`,
+          `时间：${fmtTs(c.startAt)} → ${fmtTs(c.endAt)}（首道开工 → 末道完工）`,
+          `用时 ${c.hours.toFixed(1)}h · ${c.steps} 条记录${c.spansDays ? ' · 跨天作业' : ''}${
+            c.incomplete ? ' · 未完' : ''
+          }`
         ]
-        const chainLine = cycleChainageText(row)
+        const chainLine = cycleChainageText(c)
         if (chainLine) lines.push(chainLine)
         return lines.join('<br/>')
       }
     },
-    grid: { left: 138, right: 54, top: 8, bottom: 22 },
+    grid: { left: 118, right: 52, top: 8, bottom: 22 },
+    xAxis: {
+      type: 'value',
+      name: 'h',
+      nameTextStyle: { fontSize: 9, color: '#8b95a1' },
+      axisLabel: { fontSize: 9, color: '#8b95a1' },
+      splitLine: { lineStyle: { color: '#f2f3f5' } }
+    },
+    yAxis: {
+      type: 'category',
+      data: rows.map((r) => r.label),
+      axisLabel: {
+        fontSize: 9,
+        color: '#4a5461',
+        lineHeight: 11,
+        width: 112,
+        overflow: 'truncate',
+        // 「工作面 · 桩号 · 类型」拆两行：第一行工作面+桩号，第二行开挖/支护
+        formatter: (value: string) => {
+          const parts = value.split(' · ')
+          if (parts.length >= 3) return `${parts[0]} · ${parts[1]}\n${parts.slice(2).join(' · ')}`
+          const m = /^(\d{2}-\d{2}) (.+)$/.exec(value)
+          return m ? `${m[1]}\n${m[2]}` : value
+        }
+      }
+    },
+    series: [
+      {
+        type: 'bar',
+        barMaxWidth: 12,
+        data: rows.map((r) => ({ value: Number(r.cycle.hours.toFixed(2)), itemStyle: { color: r.color } })),
+        label: {
+          show: true,
+          position: 'right',
+          fontSize: 8,
+          color: '#4a5461',
+          formatter: (p: unknown) => {
+            const idx = (p as { dataIndex: number }).dataIndex
+            const r = rows[idx]
+            if (!r) return ''
+            return `${r.cycle.hours.toFixed(1)}h${r.cycle.spansDays ? ' 跨天' : ''}${
+              r.cycle.incomplete ? ' 未完' : ''
+            }`
+          }
+        }
+      }
+    ]
+  } as EChartsOption
+})
+
+const combinedRows = computed(() => {
+  const rounds = combinedResult.value?.rounds ?? []
+  return rounds.slice(-12).reverse().map((r) => ({
+    ...r,
+    label: combinedLabel(r.startDate, r.endDate, r.spansDays)
+  }))
+})
+
+const combinedChartOption = computed<EChartsOption>(() => {
+  const rows = combinedRows.value
+  const face = faceNameOf(state.scope.workfaceId)
+  return {
+    tooltip: {
+      trigger: 'axis',
+      axisPointer: { type: 'shadow' },
+      formatter: (params: unknown) => {
+        const arr = params as Array<{ dataIndex: number }>
+        const row = rows[arr[0]?.dataIndex ?? 0]
+        if (!row) return ''
+        const lines = [`<b>${row.label}</b>`, `工作面：${face}`]
+        lines.push(row.excHours === null ? '开挖段：缺' : `开挖段 ${row.excHours.toFixed(1)}h`)
+        if (row.gapHours !== null) lines.push(`间隔 ${row.gapHours.toFixed(1)}h`)
+        lines.push(row.supHours === null ? '支护段：缺' : `支护段 ${row.supHours.toFixed(1)}h`)
+        lines.push(row.hours === null ? '综合用时：缺环节，不计算' : `综合 ${row.hours.toFixed(1)}h`)
+        if (state.scope.chainage) lines.push(`桩号 ${shortChainageText(state.scope.chainage)}`)
+        return lines.join('<br/>')
+      }
+    },
+    legend: { data: ['开挖段', '间隔', '支护段'], top: 0, itemHeight: 8, textStyle: { fontSize: 10 } },
+    grid: { left: 62, right: 30, top: 30, bottom: 22 },
     xAxis: {
       type: 'value',
       name: 'h',
@@ -370,176 +430,103 @@ const cycleChartOption = computed<EChartsOption>(() => {
     },
     series: [
       {
+        name: '开挖段',
         type: 'bar',
-        barMaxWidth: 12,
-        data: rows.map((r) => ({ value: Number(r.activeHours.toFixed(2)), itemStyle: { color: r.color } })),
-        label: {
-          show: true,
-          position: 'right',
-          fontSize: 8,
-          color: '#4a5461',
-          formatter: (p: unknown) => {
-            const idx = (p as { dataIndex: number }).dataIndex
-            const r = rows[idx]
-            if (!r) return ''
-            return `${r.activeHours.toFixed(1)}h${r.spansDays ? ' 跨天' : ''}${r.incomplete ? ' 未完' : ''}`
-          }
-        }
+        stack: 'span',
+        data: rows.map((r) => (r.excHours === null ? null : Number(r.excHours.toFixed(2)))),
+        barMaxWidth: 14,
+        itemStyle: { color: CYCLE_FAMILIES.exc.color }
+      },
+      {
+        name: '间隔',
+        type: 'bar',
+        stack: 'span',
+        data: rows.map((r) => (r.gapHours === null ? null : Number(r.gapHours.toFixed(2)))),
+        itemStyle: { color: '#d7dde5' }
+      },
+      {
+        name: '支护段',
+        type: 'bar',
+        stack: 'span',
+        data: rows.map((r) => (r.supHours === null ? null : Number(r.supHours.toFixed(2)))),
+        itemStyle: { color: CYCLE_FAMILIES.sup.color }
       }
     ]
   } as EChartsOption
 })
 
-/** 24 小时圆盘：只在"日"模式用，数据就是当天范围内的记录 */
-const dayRing = computed(() =>
-  buildDayRing({
-    date: anchor.value,
-    records: inRange.value,
-    processById: processById.value,
-    wbsById: wbsById.value,
-    byProcess: state.scope.level === 'item'
-  })
-)
-
-/** 范围=整体时，工序条目要带上所属分项工程，否则同名工序分不清 */
-const rankRows = computed(() => {
-  const rows = procAgg.value.slice(0, 10)
-  const withLabel = rows.map((p) => ({
-    ...p,
-    label:
-      state.scope.level === 'all'
-        ? `${p.processName}\n${shortItemLabel(p.itemName)}`
-        : p.processName
-  }))
-  return withLabel.reverse()
-})
-
-const rankHasReference = computed(() => rankRows.value.some((p) => p.baselineKind === 'reference'))
-
-const processRankOption = computed<EChartsOption>(() => {
-  const rows = rankRows.value
-  const baselineName = rankHasReference.value ? '标准 / 参考用时' : '标准用时'
-  return {
-    tooltip: {
-      trigger: 'axis',
-      axisPointer: { type: 'shadow' },
-      formatter: (params: unknown) => {
-        const arr = params as Array<{ dataIndex: number }>
-        const row = rows[arr[0]?.dataIndex ?? 0]
-        if (!row) return ''
-        const base = row.baselineTotal === null ? null : row.baselineTotal
-        const dev = row.deviation === null ? '—' : fmtPercent(row.deviation)
-        return [
-          `<b>${row.processName}</b>`,
-          row.itemName,
-          `实际 ${row.actualHours.toFixed(1)}h（${row.count} 次）`,
-          base === null ? '基准：未设置' : `基准 ${base.toFixed(1)}h（${row.baselineKind === 'reference' ? '参考' : '标准'}）`,
-          `偏差 ${dev}`,
-          ...(row.chainages.length
-            ? [`桩号 ${row.chainages.slice(0, 3).join(' / ')}${row.chainages.length > 3 ? ' 等' : ''}`]
-            : [])
-        ].join('<br/>')
-      }
-    },
-    legend: { data: ['实际用时', baselineName], top: 0, itemHeight: 8, textStyle: { fontSize: 11 } },
-    grid: { left: 118, right: 18, top: 30, bottom: 18 },
-    xAxis: {
-      type: 'value',
-      axisLabel: { fontSize: 9, color: '#8b95a1' },
-      splitLine: { lineStyle: { color: '#f2f3f5' } }
-    },
-    yAxis: {
-      type: 'category',
-      data: rows.map((p) => p.label),
-      axisLabel: {
-        fontSize: 9,
-        color: '#4a5461',
-        lineHeight: 11,
-        formatter: (value: string) => value
-      }
-    },
-    series: [
-      {
-        name: '实际用时',
-        type: 'bar',
-        data: rows.map((p) => Number(p.actualHours.toFixed(2))),
-        itemStyle: { color: '#2b7fff', borderRadius: [0, 4, 4, 0] },
-        barMaxWidth: 9
-      },
-      {
-        name: baselineName,
-        type: 'bar',
-        data: rows.map((p) => (p.baselineTotal === null ? 0 : Number(p.baselineTotal.toFixed(2)))),
-        itemStyle: { color: '#c9d8f5', borderRadius: [0, 4, 4, 0] },
-        barMaxWidth: 9
-      }
-    ]
-  }
-})
-
-/** 用时占比饼图：整体/单位工程看工作面，选定分项后看工序 */
-const timePieRows = computed(() => {
-  if (state.scope.level === 'item' && state.scope.processId) return []
-  if (state.scope.level === 'item') {
-    return procAgg.value.map((p) => ({
-      name: p.processName,
-      value: Number(p.actualHours.toFixed(2)),
-      detail: p.itemName,
-      count: p.count,
-      chainages: p.chainages
-    }))
-  }
-  return itemAgg.value.map((i) => ({
-    name: i.shortName,
-    value: Number(i.actualHours.toFixed(2)),
-    detail: i.itemName,
-    count: i.count,
-    chainages: i.chainages
-  }))
-})
-
-const timePieTitle = computed(() =>
-  state.scope.level === 'item' ? '各工序用时占比' : '各分项工程用时占比'
-)
-
-const timePieOption = computed<EChartsOption>(() => ({
-  tooltip: {
-    trigger: 'item',
-    formatter: (p: unknown) => {
-      const item = p as { dataIndex: number; percent: number }
-      const row = timePieRows.value[item.dataIndex]
-      if (!row) return ''
-      const chain = row.chainages.length
-        ? `<br/>桩号 ${row.chainages.slice(0, 3).join(' / ')}${row.chainages.length > 3 ? ' 等' : ''}`
-        : ''
-      return `${row.name}<br/>${row.detail}<br/>${row.value} 小时（${item.percent}%）· ${row.count} 条${chain}`
-    }
-  },
-  legend: { bottom: 0, type: 'scroll', itemHeight: 8, textStyle: { fontSize: 10 } },
-  series: [
-    {
-      type: 'pie',
-      radius: ['38%', '62%'],
-      center: ['50%', '42%'],
-      avoidLabelOverlap: true,
-      itemStyle: { borderColor: '#fff', borderWidth: 1 },
-      label: { fontSize: 10, formatter: '{b}\n{d}%' },
-      data: timePieRows.value.map((r) => ({ name: r.name, value: r.value }))
-    }
-  ]
-}))
-
+// --------------------------------------------------------------- 问题排查
 const gapRows = computed(() => computeGapRows(inRange.value, processById.value))
 const gapTop = computed(() =>
-  topGaps(gapRows.value, 8).map((g) => ({ ...g, itemName: wbsById.value.get(g.itemId)?.name ?? '' }))
+  topGaps(gapRows.value, 8).map((g) => ({
+    ...g,
+    itemName: wbsById.value.get(g.itemId)?.name ?? '未归类',
+    faceName: faceNameOf(itemWorkface.value.get(g.itemId))
+  }))
+)
+
+/**
+ * 单日超 24h 只在"单一工作面"范围内算异常：
+ * 全部 / 单位工程是多条洞并行，合计超 24h 是正常的，不能误报。
+ */
+const singleWorkface = computed(() => state.scope.level === 'workface' && Boolean(state.scope.workfaceId))
+
+const exceedDays = computed(() => {
+  if (!singleWorkface.value) return []
+  const map = new Map<string, { date: string; hours: number; count: number }>()
+  inRange.value.forEach((r) => {
+    const row = map.get(r.date) ?? { date: r.date, hours: 0, count: 0 }
+    row.hours += Number.isFinite(r.hours) ? r.hours : 0
+    row.count += 1
+    map.set(r.date, row)
+  })
+  return Array.from(map.values())
+    .filter((row) => row.hours > 24.01)
+    .sort((a, b) => b.hours - a.hours)
+})
+
+/** 本周期内"结构范围"的完整记录（不含桩号筛选）：统计桩号缺失要用它当分母，否则选了桩号永远是 0 */
+const periodBase = computed(() =>
+  baseRecords.value.filter((r) => r.date >= range.value.from && r.date <= range.value.to)
+)
+
+const missingChainage = computed(() => periodBase.value.filter((r) => !parseChainageRange(recordChainage(r))))
+
+const missingChainageFaces = computed(() => {
+  const map = new Map<string, { name: string; count: number }>()
+  missingChainage.value.forEach((r) => {
+    const p = processById.value.get(r.processId)
+    if (!p) return
+    const face = faceNameOf(itemWorkface.value.get(p.itemId))
+    const name = face || shortItemLabel(wbsById.value.get(p.itemId)?.name ?? '未归类')
+    const row = map.get(name) ?? { name, count: 0 }
+    row.count += 1
+    map.set(name, row)
+  })
+  return Array.from(map.values()).sort((a, b) => b.count - a.count)
+})
+
+/** 本周期已出现过的桩号段数（不受当前桩号筛选影响，便于判断筛掉多少） */
+const chainageCount = computed(
+  () =>
+    chainageOptionsOf({
+      records: periodBase.value,
+      processById: processById.value,
+      wbsById: wbsById.value,
+      itemWorkface: itemWorkface.value,
+      workfaceById: workfaceById.value
+    }).length
+)
+
+/** 缺环节的轮（只有选定单工作面 + 桩号时才知道怎么配对） */
+const combinedMissing = computed(() =>
+  (combinedResult.value?.rounds ?? [])
+    .filter((r) => r.missing.length > 0)
+    .map((r) => ({ ...r, label: combinedLabel(r.startDate, r.endDate, r.spansDays) }))
 )
 
 const gapRankOption = computed<EChartsOption>(() => {
   const top = [...gapTop.value].reverse()
-  const labelOf = (g: (typeof top)[number]) =>
-    state.scope.level === 'all'
-      ? `${shortItemLabel(g.itemName)}\n${g.prevProcessName}→${g.processName}${g.chainage ? ` · ${g.chainage}` : ''}`
-      : `${g.prevProcessName}→${g.processName}${g.chainage ? ` · ${g.chainage}` : ''}`
   return {
     tooltip: {
       trigger: 'axis',
@@ -548,14 +535,14 @@ const gapRankOption = computed<EChartsOption>(() => {
         const arr = params as Array<{ dataIndex: number }>
         const item = top[arr[0]?.dataIndex ?? 0]
         if (!item) return ''
-        return `${item.itemName}<br/>${item.prevProcessName} → ${item.processName}<br/>空隙 ${item.gapHours.toFixed(1)} 小时<br/>${item.date}${
-          item.chainage ? '<br/>桩号 ' + item.chainage : ''
-        }${
+        return `${item.faceName || item.itemName}<br/>${item.prevProcessName} → ${item.processName}<br/>空隙 ${item.gapHours.toFixed(
+          1
+        )} 小时<br/>${item.date}${item.chainage ? '<br/>桩号 ' + item.chainage : ''}${
           item.reason ? '<br/>原因：' + item.reason : ''
         }`
       }
     },
-    grid: { left: 108, right: 26, top: 12, bottom: 18 },
+    grid: { left: 116, right: 26, top: 12, bottom: 18 },
     xAxis: {
       type: 'value',
       axisLabel: { fontSize: 9, color: '#8b95a1' },
@@ -563,7 +550,7 @@ const gapRankOption = computed<EChartsOption>(() => {
     },
     yAxis: {
       type: 'category',
-      data: top.map(labelOf),
+      data: top.map((g) => `${g.faceName || shortItemLabel(g.itemName)}\n${g.processName}`),
       axisLabel: { fontSize: 9, color: '#4a5461', lineHeight: 11 }
     },
     series: [
@@ -575,42 +562,10 @@ const gapRankOption = computed<EChartsOption>(() => {
         label: { show: true, position: 'right', fontSize: 9, formatter: '{c}h' }
       }
     ]
-  }
+  } as EChartsOption
 })
 
-const reasonAgg = computed(() => aggregateByReason(gapRows.value))
-
-const reasonOption = computed<EChartsOption>(() => ({
-  tooltip: {
-    trigger: 'item',
-    formatter: (p: unknown) => {
-      const row = p as { name?: string; value?: number; percent?: number }
-      const chain = state.scope.chainage ? `<br/>桩号 ${shortChainageText(state.scope.chainage)}` : ''
-      return `${row.name ?? ''}<br/>${row.value ?? 0} 小时（${row.percent ?? 0}%）${chain}`
-    }
-  },
-  legend: { bottom: 0, type: 'scroll', itemHeight: 8, textStyle: { fontSize: 10 } },
-  series: [
-    {
-      type: 'pie',
-      radius: ['38%', '62%'],
-      center: ['50%', '42%'],
-      avoidLabelOverlap: true,
-      itemStyle: { borderColor: '#fff', borderWidth: 1 },
-      label: { fontSize: 10, formatter: '{b}\n{c}h' },
-      data: reasonAgg.value.map((r) => ({
-        name: r.label,
-        value: Number(r.hours.toFixed(2)),
-        itemStyle: { color: r.color }
-      }))
-    }
-  ]
-}))
-
-const itemProgress = computed(() => completionByItem(inRange.value, processById.value, wbsById.value))
-
 // ------------------------------------------------------- 选日期 / 选周期
-// 不再只靠左右箭头：点周期标签就能跳到任意一天、任意一月
 function move(delta: number) {
   anchorTouched = true
   if (periodType.value === 'day') anchor.value = addDays(anchor.value, delta)
@@ -623,15 +578,15 @@ function goToday() {
   anchor.value = todayStr()
 }
 
-/** 当前范围内最近 12 个有记录的日期 / 月份，一点直达 */
 const datesWithData = computed(() => {
   const set = new Set(scopeRecords.value.map((r) => r.date))
   return Array.from(set).sort().reverse().slice(0, 12)
 })
 
-const monthsWithData = computed(() => monthsWithRecords(scopeRecords.value).slice(-12).reverse())
+const monthsWithData = computed(() =>
+  Array.from(new Set(scopeRecords.value.map((r) => monthKey(r.date)))).sort().slice(-12).reverse()
+)
 
-/** 年 + 月 两列，给"月"模式用 */
 const monthColumns = computed(() => {
   const thisYear = new Date().getFullYear()
   const years: Array<{ text: string; value: string }> = []
@@ -645,7 +600,6 @@ const monthColumns = computed(() => {
 
 const monthPickerValue = ref<string[]>([anchor.value.slice(0, 4), anchor.value.slice(5, 7)])
 
-/** 打开选择器时把当前所在月份同步给年月选择器，避免它显示成上一次的值 */
 function openPeriodPicker() {
   monthPickerValue.value = [anchor.value.slice(0, 4), anchor.value.slice(5, 7)]
   showPeriodPicker.value = true
@@ -687,7 +641,6 @@ function onMonthPickerConfirm(payload: { selectedValues?: Array<string | number>
   if (y && m) pickAnchorMonth(`${y}-${m}`)
 }
 
-/** 底部按钮：把当前正在看的周期带进明细页 */
 function openRecords() {
   if (periodType.value === 'day') {
     void router.push({ path: '/records', query: { month: monthKey(anchor.value), date: anchor.value } })
@@ -696,9 +649,12 @@ function openRecords() {
   }
 }
 
-/** 圆盘上的扇段 / 清单点一下，进那条记录的编辑页 */
 function openRecord(recordId: string) {
   void router.push({ path: '/record', query: { id: recordId } })
+}
+
+function openDay(date: string) {
+  void router.push({ path: '/records', query: { month: monthKey(date), date } })
 }
 
 const recordsButtonLabel = computed(() =>
@@ -707,14 +663,12 @@ const recordsButtonLabel = computed(() =>
     : `查看记录明细（${monthKey(range.value.from)}）`
 )
 
-// 记住上次看的周期与位置（本机），切来切去不会跳回今天
 watch([periodType, anchor], () => {
   calendarValue.value = parseDate(anchor.value)
   void setKv(DASHBOARD_KV, { periodType: periodType.value, anchor: anchor.value })
 })
 
 async function initPosition() {
-  // 首次打开时同步可能还没跑完：等它落定，否则会按"空数据"默认到今天
   await waitForSyncSettled()
   const qPeriod = typeof route.query.period === 'string' ? route.query.period : ''
   const qDate =
@@ -751,7 +705,6 @@ function waitForSyncSettled(): Promise<void> {
   })
 }
 
-// 同步在页面打开后才完成时，把仍停在"无记录的一天"的锚点挪到最近有记录的一天
 watch([() => state.records.length, () => state.ready], () => {
   if (anchorTouched || !state.ready || !state.records.length) return
   const hasCurrent = state.records.some((r) => !r.deletedAt && r.date === anchor.value)
@@ -760,16 +713,18 @@ watch([() => state.records.length, () => state.ready], () => {
   if (latest !== anchor.value) anchor.value = latest
 })
 
-/**
- * 默认定位：今天有记录就看今天；今天还没记（早上刚打开、或最近停工），
- * 直接落到最近有记录的那一天，省得一进来是空图。
- */
 function latestDayWithRecords(): string {
   const today = todayStr()
   const dates = scopeRecords.value.map((r) => r.date)
   if (!dates.length || dates.includes(today)) return today
   return dates.sort()[dates.length - 1]
 }
+
+/** 当前工作面名称（综合卡片标题用） */
+const currentWorkfaceName = computed(() => faceNameOf(state.scope.workfaceId))
+
+/** 综合视图当前桩号 */
+const currentChainage = computed(() => (state.scope.chainage ? shortChainageText(state.scope.chainage) : ''))
 
 onMounted(() => {
   void initPosition()
@@ -782,10 +737,10 @@ onMounted(() => {
   <div class="page">
     <ScopePicker />
 
-    <van-tabs v-model:active="periodType" type="card">
-      <van-tab title="日" name="day" />
-      <van-tab title="周" name="week" />
-      <van-tab title="月" name="month" />
+    <van-tabs v-model:active="tab" type="card">
+      <van-tab title="总览" name="overview" />
+      <van-tab title="循环分析" name="cycles" />
+      <van-tab title="问题排查" name="issues" />
     </van-tabs>
 
     <div class="card" style="margin-top: 12px">
@@ -798,164 +753,293 @@ onMounted(() => {
         <van-icon name="arrow" size="18" @click="move(1)" />
       </div>
       <div class="divider" />
-      <div class="muted scope-echo">当前范围：{{ scopeName }}</div>
+      <van-tabs v-model:active="periodType" type="card">
+        <van-tab title="日" name="day" />
+        <van-tab title="周" name="week" />
+        <van-tab title="月" name="month" />
+      </van-tabs>
       <div class="muted today-link" @click="goToday">回到今天</div>
     </div>
 
-    <div class="kpi-grid">
-      <StatCard label="实际工时" :value="fmtHoursShort(stats.actualHours)" :hint="`${stats.recordCount} 条记录`" />
-      <StatCard label="基准工时" :value="fmtHoursShort(stats.baselineHours)" :hint="caliberText" />
-      <StatCard
-        label="效率（总量口径）"
-        :value="fmtPercent(stats.totalEfficiency)"
-        tone="efficiency"
-        :ratio="stats.totalEfficiency"
-        :hint="
-          efficiencyDelta === null
-            ? caliberText
-            : `较上期 ${efficiencyDelta >= 0 ? '+' : ''}${(efficiencyDelta * 100).toFixed(1)} 个百分点`
-        "
-      />
-      <StatCard
-        label="效率（工序平均）"
-        :value="fmtPercent(stats.avgDeviation)"
-        tone="efficiency"
-        :ratio="stats.avgDeviation"
-        hint="各工序偏差率的平均值"
-      />
-      <StatCard
-        label="衔接空隙"
-        :value="fmtHoursShort(stats.gapHours)"
-        :hint="`占周期 ${(gapRatio * 100).toFixed(1)}% · ${stats.gapCount} 处`"
-      />
-      <StatCard
-        label="工时环比"
-        :value="hoursDelta === null ? '—' : `${hoursDelta >= 0 ? '+' : ''}${(hoursDelta * 100).toFixed(1)}%`"
-        :hint="`上期 ${fmtHoursShort(prevStats.actualHours)}`"
-      />
-      <StatCard
-        label="开挖循环总用时"
-        :value="excCycle.count ? fmtHoursShort(excCycle.totalHours) : '—'"
-        :hint="cycleHint(excCycle)"
-      />
-      <StatCard
-        label="支护循环总用时"
-        :value="supCycle.count ? fmtHoursShort(supCycle.totalHours) : '—'"
-        :hint="cycleHint(supCycle)"
-      />
-    </div>
-
-    <div v-if="stats.recordCount === 0" class="card tip-card">
-      该范围在本周期内没有记录。可切换分析范围，或点上面的“点这里回到今天 / 往前翻”。
-    </div>
-    <div v-else-if="stats.baselineSource === 'none'" class="card tip-card" @click="router.push('/manage')">
-      该范围还没有基准：标准用时与参考用时都为空，效率显示“—”。可到「工程 → 标准用时」补上 →
-    </div>
-    <div v-else-if="stats.baselineSource !== 'standard'" class="card tip-card">
-      当前按<b>参考口径</b>计算（标准用时未填的工序用实测参考用时）。到「工程 → 标准用时」一键采用后自动切回标准口径。
-    </div>
-    <div v-if="exceedPeriods.length" class="card tip-card warn">
-      有 {{ exceedPeriods.length }} 天单日工时超过 24 小时（图中日期标红），可能是同一天有重复或重叠记录，建议到明细页核对。
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        循环用时（按桩号）
-        <span class="sub">有桩号按段显示 · 已剔除 &gt;6h 停工</span>
-      </div>
-      <ChartBox
-        v-if="cycleChart.rows.length"
-        :option="cycleChartOption"
-        :height="Math.max(190, cycleChart.rows.length * 42 + 50)"
-      />
-      <van-empty v-else description="本期没有完整循环" image-size="60" />
-      <div v-if="cycleChart.restCount" class="muted" style="margin-top: 6px; text-align: right">
-        另有 {{ cycleChart.restCount }} 轮（合计 {{ fmtHoursShort(cycleChart.restHours) }}）未画出
-      </div>
-    </div>
-
-    <div v-if="periodType === 'day'" class="card">
-      <div class="card-title">
-        一天在干什么（24 小时圆盘）
-        <span class="sub">整圈 24h · 详情含桩号</span>
-      </div>
-      <DayRing v-if="dayRing.stats.count" :data="dayRing" :date-label="anchor.slice(5)" @pick="openRecord" />
-      <van-empty v-else description="这一天没有记录" image-size="60" />
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        工序用时排行
-        <span class="sub">{{ rankHasReference ? '实际 vs 标准/参考' : '实际 vs 标准' }}</span>
-      </div>
-      <ChartBox
-        v-if="rankRows.length"
-        :option="processRankOption"
-        :height="Math.max(200, rankRows.length * 38 + 60)"
-      />
-      <van-empty v-else description="本期没有工序记录" image-size="60" />
-    </div>
-
-    <div v-if="timePieRows.length > 1" class="card">
-      <div class="card-title">
-        {{ timePieTitle }}
-        <span class="sub">按工时</span>
-      </div>
-      <ChartBox :option="timePieOption" :height="260" />
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        {{ trendTitle }}
-        <span class="sub">柱：工时构成　线：效率</span>
-      </div>
-      <ChartBox :option="trendOption" :height="270" />
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        衔接空隙排行
-        <span class="sub">超过 {{ GAP_TOLERANCE_MINUTES }} 分钟、6 小时以内</span>
-      </div>
-      <ChartBox
-        v-if="gapTop.length"
-        :option="gapRankOption"
-        :height="Math.max(180, gapTop.length * 38 + 40)"
-      />
-      <van-empty v-else description="本期衔接顺畅，未发现明显空档" image-size="60" />
-    </div>
-
-    <div class="card">
-      <div class="card-title">
-        空隙原因分布
-        <span class="sub">按等待时长</span>
-      </div>
-      <ChartBox v-if="reasonAgg.length" :option="reasonOption" :height="250" />
-      <van-empty v-else description="还没有填写等待原因" image-size="60" />
-    </div>
-
-    <div v-if="itemProgress.some((i) => i.doneQty > 0)" class="card">
-      <div class="card-title">
-        分项工程完成情况
-        <span class="sub">已完成 / 设计总量</span>
-      </div>
-      <div v-for="item in itemProgress" :key="item.itemId" class="progress-row">
-        <div class="row-between">
-          <div class="progress-name">{{ item.itemName }}</div>
-          <div class="num muted">
-            {{ item.doneQty.toFixed(1) }}<template v-if="item.designQty"> / {{ item.designQty }}</template>
-            <template v-if="item.percent"> （{{ (item.percent * 100).toFixed(1) }}%）</template>
-          </div>
-        </div>
-        <van-progress
-          :percentage="Math.min(100, Math.round(item.percent * 100))"
-          :show-pivot="false"
-          stroke-width="6"
-          color="#2b7fff"
-          track-color="#eef1f5"
+    <!-- ------------------------------------------------------------ 总览 -->
+    <template v-if="tab === 'overview'">
+      <div class="kpi-grid">
+        <StatCard label="实际工时" :value="fmtHoursShort(stats.actualHours)" :hint="`${stats.recordCount} 条记录`" />
+        <StatCard label="基准工时" :value="fmtHoursShort(stats.baselineHours)" :hint="caliberText" />
+        <StatCard
+          label="效率（总量口径）"
+          :value="fmtPercent(stats.totalEfficiency)"
+          tone="efficiency"
+          :ratio="stats.totalEfficiency"
+          :hint="
+            efficiencyDelta === null
+              ? caliberText
+              : `较上期 ${efficiencyDelta >= 0 ? '+' : ''}${(efficiencyDelta * 100).toFixed(1)} 个百分点`
+          "
+        />
+        <StatCard
+          label="衔接空隙"
+          :value="fmtHoursShort(stats.gapHours)"
+          :hint="`占周期 ${(gapRatio * 100).toFixed(1)}% · ${stats.gapCount} 处`"
         />
       </div>
-    </div>
+
+      <div v-if="stats.recordCount === 0" class="card tip-card">
+        该范围在本周期内没有记录。可修改筛选，或点上面的日期往前翻。
+      </div>
+      <div v-else-if="stats.baselineSource === 'none'" class="card tip-card" @click="router.push('/manage')">
+        该范围还没有基准：标准用时与参考用时都为空，效率显示“—”。可到「工程 → 标准用时」补上 →
+      </div>
+      <div v-else-if="stats.baselineSource !== 'standard'" class="card tip-card">
+        当前按<b>参考口径</b>计算（标准用时未填的工序用实测参考用时）。
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          一天在干什么
+          <span class="sub">{{
+            periodType === 'day' ? '整圈 24h · 详情含工作面与桩号' : '每天工时构成 · 按工作面'
+          }}</span>
+        </div>
+        <template v-if="periodType === 'day'">
+          <DayRing v-if="dayRing.stats.count" :data="dayRing" :date-label="anchor.slice(5)" @pick="openRecord" />
+          <van-empty v-else description="这一天没有记录" image-size="60" />
+        </template>
+        <template v-else>
+          <ChartBox v-if="inRange.length" :option="dailyMainOption" :height="280" />
+          <van-empty v-else description="本周期没有记录" image-size="60" />
+          <div v-if="workfaceAgg.length" class="face-summary">
+            <span v-for="row in workfaceAgg.slice(0, 4)" :key="row.workfaceId" class="face-pill">
+              {{ row.workfaceName }} {{ fmtHoursShort(row.actualHours) }}
+            </span>
+          </div>
+        </template>
+      </div>
+    </template>
+
+    <!-- -------------------------------------------------------- 循环分析 -->
+    <template v-else-if="tab === 'cycles'">
+      <div class="seg" role="group" aria-label="循环类型">
+        <button
+          type="button"
+          class="seg-btn"
+          :class="{ active: cycleTab === 'exc' }"
+          :aria-pressed="cycleTab === 'exc'"
+          aria-label="看开挖循环"
+          @click="cycleTab = 'exc'"
+        >
+          开挖
+        </button>
+        <button
+          type="button"
+          class="seg-btn"
+          :class="{ active: cycleTab === 'sup' }"
+          :aria-pressed="cycleTab === 'sup'"
+          aria-label="看支护循环"
+          @click="cycleTab = 'sup'"
+        >
+          支护
+        </button>
+        <button
+          type="button"
+          class="seg-btn"
+          :class="{ active: cycleTab === 'both' }"
+          :aria-pressed="cycleTab === 'both'"
+          :disabled="!combinedAvailable"
+          :aria-label="combinedAvailable ? '看开挖与支护综合' : '综合视图需先选定单一工作面和桩号'"
+          @click="cycleTab = 'both'"
+        >
+          综合
+        </button>
+      </div>
+
+      <div v-if="!combinedAvailable" class="card tip-card">
+        综合模式只在<b>选定单一工作面 + 一个桩号</b>时可用：点「修改筛选」选好工作面与桩号后再回来。
+      </div>
+
+      <template v-if="cycleTab !== 'both'">
+        <div class="kpi-grid three">
+          <StatCard
+            :label="cycleTab === 'exc' ? '开挖轮数' : '支护轮数'"
+            :value="String(cycleTab === 'exc' ? excSummary.count : supSummary.count)"
+            :hint="cycleHint(cycleTab === 'exc' ? excSummary : supSummary)"
+          />
+          <StatCard
+            label="循环总用时"
+            :value="fmtHoursShort(cycleTab === 'exc' ? excSummary.totalHours : supSummary.totalHours)"
+            hint="首道开工 → 末道完工"
+          />
+          <StatCard
+            label="平均每轮"
+            :value="fmtHoursShort(cycleTab === 'exc' ? excSummary.avgHours : supSummary.avgHours)"
+            :hint="`跨天 ${cycleTab === 'exc' ? excSummary.spanning : supSummary.spanning} 轮`"
+          />
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            {{ cycleTab === 'exc' ? '开挖循环用时' : '支护循环用时' }}
+            <span class="sub">{{ state.scope.chainage ? '已按桩号筛选' : '含跨天与中间停工' }}</span>
+          </div>
+          <ChartBox
+            v-if="cycleRows.rows.length"
+            :option="cycleChartOption"
+            :height="Math.max(200, cycleRows.rows.length * 42 + 50)"
+          />
+          <van-empty v-else description="本期没有完整循环" image-size="60" />
+          <div v-if="cycleRows.rest" class="muted" style="margin-top: 6px; text-align: right">
+            另有 {{ cycleRows.rest }} 轮（合计 {{ fmtHoursShort(cycleRows.restHours) }}）未画出
+          </div>
+        </div>
+      </template>
+
+      <template v-else>
+        <div class="kpi-grid three">
+          <StatCard
+            label="完整轮数"
+            :value="String(combinedResult?.complete ?? 0)"
+            :hint="`缺支护 ${combinedResult?.missingSup ?? 0} · 缺开挖 ${combinedResult?.missingExc ?? 0}`"
+          />
+          <StatCard label="综合总用时" :value="fmtHoursShort(combinedResult?.totalHours ?? 0)" hint="只累加完整轮" />
+          <StatCard label="平均每轮" :value="combinedAvgText" hint="开挖首道 → 支护末道" />
+        </div>
+
+        <div v-if="combinedMissing.length" class="card tip-card warn">
+          有 {{ combinedResult?.missingSup ?? 0 }} 轮缺支护、{{ combinedResult?.missingExc ?? 0 }} 轮缺开挖，
+          这些轮不生成综合用时（避免造假数据），可在下方明细里核对。
+        </div>
+
+        <div class="card">
+          <div class="card-title">
+            综合用时（{{ currentWorkfaceName }} · {{ currentChainage }}）
+            <span class="sub">开挖首道开工 → 支护末道完工</span>
+          </div>
+          <ChartBox
+            v-if="combinedRows.length"
+            :option="combinedChartOption"
+            :height="Math.max(200, combinedRows.length * 42 + 60)"
+          />
+          <van-empty v-else description="本期没有可配对的循环" image-size="60" />
+        </div>
+
+        <div v-if="combinedRows.length" class="card">
+          <div class="card-title">逐轮明细<span class="sub">开挖段 / 间隔 / 支护段</span></div>
+          <div v-for="row in combinedRows" :key="row.id" class="combined-row">
+            <div class="row-between">
+              <span class="combined-date">{{ row.label }}</span>
+              <span v-if="row.hours !== null" class="num combined-total">{{ fmtHoursShort(row.hours) }}</span>
+              <span v-else class="missing-tag">
+                {{ row.missing.includes('exc') ? '缺开挖' : '缺支护' }}
+              </span>
+            </div>
+            <div class="muted combined-parts">
+              开挖段 {{ row.excHours === null ? '—' : fmtHoursShort(row.excHours) }} · 间隔
+              {{ row.gapHours === null ? '—' : fmtHoursShort(row.gapHours) }} · 支护段
+              {{ row.supHours === null ? '—' : fmtHoursShort(row.supHours) }}
+            </div>
+          </div>
+        </div>
+      </template>
+    </template>
+
+    <!-- -------------------------------------------------------- 问题排查 -->
+    <template v-else>
+      <div class="card">
+        <div class="card-title">
+          异常：单日工时超过 24 小时
+          <span class="sub">同一天重复或重叠记录</span>
+        </div>
+        <template v-if="exceedDays.length">
+          <div v-for="row in exceedDays" :key="row.date" class="issue-row">
+            <div class="issue-main">
+              <div class="issue-title">{{ row.date }} · {{ fmtHoursShort(row.hours) }}</div>
+              <div class="muted">{{ row.count }} 条记录，超过一天 24 小时</div>
+            </div>
+            <button type="button" class="chip" :aria-label="`查看 ${row.date} 的记录`" @click="openDay(row.date)">
+              看明细
+            </button>
+          </div>
+        </template>
+        <div v-else-if="!singleWorkface" class="muted empty-line">
+          {{ state.scope.level === 'workface' ? '这一个工作面没有单日超 24 小时' : '选定单一工作面后才判断单日超 24 小时（多条洞并行时合计超 24h 是正常的）' }}
+        </div>
+        <div v-else class="muted empty-line">没有单日超 24 小时的异常</div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          长间隔（衔接空隙）
+          <span class="sub">超过 {{ GAP_TOLERANCE_MINUTES }} 分钟、6 小时以内</span>
+        </div>
+        <ChartBox v-if="gapTop.length" :option="gapRankOption" :height="Math.max(180, gapTop.length * 38 + 40)" />
+        <div v-else class="muted empty-line">本期衔接顺畅，未发现明显空档</div>
+        <div v-if="gapTop.length" class="issue-list">
+          <button
+            v-for="g in gapTop"
+            :key="g.recordId"
+            type="button"
+            class="issue-row as-button"
+            :aria-label="`查看 ${g.date} ${g.processName} 的记录`"
+            @click="openRecord(g.recordId)"
+          >
+            <div class="issue-main">
+              <div class="issue-title">
+                {{ g.faceName || shortItemLabel(g.itemName) }} · {{ g.prevProcessName }} → {{ g.processName }}
+              </div>
+              <div class="muted">
+                {{ g.date }} · {{ g.chainage ? '桩号 ' + g.chainage + ' · ' : '' }}{{ g.reason || '未填原因' }}
+              </div>
+            </div>
+            <span class="num gap-hours">{{ fmtHoursShort(g.gapHours) }}</span>
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-title">
+          缺失：桩号未填
+          <span class="sub">按桩号分析会漏掉这些记录</span>
+        </div>
+        <div class="issue-summary">
+          本周期 {{ periodBase.length }} 条记录里，<b>{{ missingChainage.length }}</b> 条没有可识别桩号；
+          已出现桩号 {{ chainageCount }} 段。
+        </div>
+        <div v-if="missingChainageFaces.length" class="face-summary">
+          <span v-for="row in missingChainageFaces.slice(0, 6)" :key="row.name" class="face-pill">
+            {{ row.name }} {{ row.count }} 条
+          </span>
+        </div>
+        <div class="muted" style="margin-top: 6px">
+          桩号不批量回填；打开对应记录补填后，下一次同步即可按桩号查看。
+        </div>
+      </div>
+
+      <div v-if="combinedAvailable" class="card">
+        <div class="card-title">
+          缺失：循环缺环节
+          <span class="sub">综合视图配对结果</span>
+        </div>
+        <template v-if="combinedMissing.length">
+          <div v-for="row in combinedMissing" :key="row.id" class="issue-row">
+            <div class="issue-main">
+              <div class="issue-title">{{ row.label }}</div>
+              <div class="muted">
+                {{ row.missing.includes('exc') ? '这一轮只有支护，缺开挖' : '这一轮只有开挖，缺支护' }}
+              </div>
+            </div>
+            <button
+              type="button"
+              class="chip"
+              :aria-label="`查看 ${row.startDate} 的记录`"
+              @click="openDay(row.startDate)"
+            >
+              看明细
+            </button>
+          </div>
+        </template>
+        <div v-else class="muted empty-line">开挖与支护都配上了，没有缺环节</div>
+      </div>
+    </template>
 
     <van-button block plain type="primary" @click="openRecords">{{ recordsButtonLabel }}</van-button>
     <div class="bottom-space" />
@@ -978,12 +1062,7 @@ onMounted(() => {
           </div>
           <div class="group-title">或按月选择</div>
           <div class="sheet-actions">
-            <van-picker
-              :columns="monthColumns"
-              :model-value="monthPickerValue"
-              title=""
-              @confirm="onMonthPickerConfirm"
-            />
+            <van-picker :columns="monthColumns" :model-value="monthPickerValue" title="" @confirm="onMonthPickerConfirm" />
           </div>
         </template>
 
@@ -1017,14 +1096,20 @@ onMounted(() => {
 </template>
 
 <style scoped>
-.progress-row {
-  padding: 8px 0;
+.kpi-grid.three {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
-.progress-name {
-  font-size: 13px;
-  font-weight: 500;
-  margin-bottom: 6px;
+.kpi-grid.three :deep(.kpi) {
+  padding: 10px;
+}
+
+.kpi-grid.three :deep(.kpi .value) {
+  font-size: 17px;
+}
+
+.kpi-grid.three :deep(.kpi .muted) {
+  font-size: 11px;
 }
 
 .tip-card {
@@ -1037,10 +1122,6 @@ onMounted(() => {
 .tip-card.warn {
   color: #d14343;
   background: #fdecec;
-}
-
-.scope-echo {
-  word-break: break-all;
 }
 
 .period-center {
@@ -1057,6 +1138,137 @@ onMounted(() => {
   text-align: center;
   margin-top: 6px;
   color: #1f6feb;
+}
+
+.seg {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.seg-btn {
+  flex: 1;
+  border: 1px solid #dfe4ea;
+  background: #fff;
+  border-radius: 10px;
+  padding: 9px 0;
+  font-size: 14px;
+  color: #33404f;
+  font-family: inherit;
+}
+
+.seg-btn.active {
+  border-color: #1f6feb;
+  background: #eef3ff;
+  color: #1f6feb;
+  font-weight: 600;
+}
+
+.seg-btn:disabled {
+  color: #b6bec8;
+  background: #f7f8fa;
+}
+
+.seg-btn:focus-visible,
+.chip:focus-visible,
+.issue-row.as-button:focus-visible {
+  outline: 2px solid #1f6feb;
+  outline-offset: 2px;
+}
+
+.face-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.face-pill {
+  border: 1px solid #e6e9ee;
+  background: #f8f9fb;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: #4a5461;
+}
+
+.combined-row {
+  padding: 10px 0;
+  border-bottom: 1px solid #f4f5f7;
+}
+
+.combined-date {
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.combined-total {
+  font-size: 14px;
+  font-weight: 600;
+  color: #1f6feb;
+}
+
+.combined-parts {
+  margin-top: 4px;
+  font-size: 12px;
+}
+
+.missing-tag {
+  font-size: 12px;
+  color: #d14343;
+  background: #fdecec;
+  border-radius: 6px;
+  padding: 2px 8px;
+}
+
+.issue-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid #f4f5f7;
+  width: 100%;
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
+  border-left: none;
+  border-right: none;
+  border-bottom: none;
+}
+
+.issue-row.as-button {
+  cursor: pointer;
+}
+
+.issue-main {
+  min-width: 0;
+}
+
+.issue-title {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.issue-list {
+  margin-top: 6px;
+}
+
+.empty-line {
+  padding: 12px 0;
+  font-size: 13px;
+}
+
+.issue-summary {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.gap-hours {
+  flex-shrink: 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: #b26a00;
 }
 
 .sheet {
@@ -1106,6 +1318,7 @@ onMounted(() => {
   padding: 7px 14px;
   font-size: 13px;
   color: #33404f;
+  font-family: inherit;
 }
 
 .sheet-actions {

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { buildDayRing, coveredMinutes, ringArcPath, RING_MAX_LANES } from '@/core/dayRing'
-import type { Process, ProcessRecord, WbsNode } from '@/types'
+import type { Process, ProcessRecord, WbsNode, Workface } from '@/types'
 
 const DATE = '2026-09-20'
 const NEXT = '2026-09-21'
@@ -196,5 +196,36 @@ describe('区间合并', () => {
     expect(coveredMinutes([[0, 60], [30, 90]])).toBe(90)
     expect(coveredMinutes([[-60, 60], [1400, 1500]])).toBe(60 + 40)
     expect(coveredMinutes([])).toBe(0)
+  })
+})
+
+describe('工作面与桩号显示', () => {
+  it('有工作面时圆盘标签用工作面名，颜色键也按工作面归并', () => {
+    const workfaceById = new Map<string, Workface>([
+      ['wf1', { id: 'wf1', projectId: 'p', unitId: 'u1', name: '1#支洞', sort: 1, updatedAt: 0 }],
+      ['wf2', { id: 'wf2', projectId: 'p', unitId: 'u1', name: '2#支洞', sort: 2, updatedAt: 0 }]
+    ])
+    const itemWorkface = new Map([
+      ['i-1zd', 'wf1'],
+      ['i-2zd', 'wf2']
+    ])
+    const data = buildDayRing({
+      date: DATE,
+      records: [
+        { ...rec('r1', 'p-blast', '08:00', '12:00', 4), chainage: '0+545~0+548' },
+        rec('r2', 'p-drill', '13:00', '15:00', 2)
+      ],
+      processById: PROC_MAP,
+      wbsById: WBS_MAP,
+      byProcess: false,
+      itemWorkface,
+      workfaceById
+    })
+    const byId = new Map(data.segments.map((s) => [s.recordId, s]))
+    expect(byId.get('r1')?.itemShort).toBe('1#支洞')
+    expect(byId.get('r1')?.colorKey).toBe('1#支洞')
+    expect(byId.get('r1')?.chainage).toBe('545-548')
+    expect(byId.get('r2')?.itemShort).toBe('2#支洞')
+    expect(data.legend.map((l) => l.label).sort()).toEqual(['1#支洞', '2#支洞'])
   })
 })

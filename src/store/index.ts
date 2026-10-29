@@ -1,18 +1,21 @@
 import { reactive } from 'vue'
-import type { Operator, Process, ProcessRecord, Project, WbsNode } from '@/types'
+import type { Operator, Process, ProcessRecord, Project, WbsNode, Workface } from '@/types'
 import {
   ensureDeviceId,
+  ensureWorkfaces,
   getKv,
   listOperators,
   listProcesses,
   listProjects,
   listRecords,
   listWbs,
+  listWorkfaces,
   saveOperator,
   setKv
 } from '@/db'
 import { syncNow, syncState as readSyncState, type SyncBackend } from '@/sync'
-import { ALL_SCOPE, scopeLabel, scopedProcessIds, type AnalysisScope } from '@/core/scope'
+import { ALL_SCOPE, normalizeScope, type AnalysisScope } from '@/core/scope'
+import { buildItemWorkfaceMap } from '@/core/workface'
 
 export interface SyncViewState {
   configured: boolean
@@ -37,6 +40,8 @@ interface AppState {
   wbs: WbsNode[]
   processes: Process[]
   records: ProcessRecord[]
+  /** 工作面：分项工程按洞室 / 部位归组 */
+  workfaces: Workface[]
   sync: SyncViewState
   /** 当前分析范围（看板与明细页共用） */
   scope: AnalysisScope
@@ -52,6 +57,7 @@ export const state = reactive<AppState>({
   wbs: [] as WbsNode[],
   processes: [] as Process[],
   records: [] as ProcessRecord[],
+  workfaces: [] as Workface[],
   sync: {
     configured: false,
     backend: 'gitee' as SyncBackend,
@@ -110,11 +116,19 @@ export async function refreshStructure(): Promise<void> {
   if (!state.currentProjectId) {
     state.wbs = []
     state.processes = []
+    state.workfaces = []
     return
   }
-  const [wbs, processes] = await Promise.all([listWbs(state.currentProjectId), listProcesses(state.currentProjectId)])
+  const projectId = state.currentProjectId
+  const [wbs, processes] = await Promise.all([listWbs(projectId), listProcesses(projectId)])
   state.wbs = wbs
   state.processes = processes
+  // 旧数据 / 旧云端目录没有工作面：加载后幂等补建，不会重复创建
+  const init = await ensureWorkfaces(projectId)
+  if (init.created || init.bound || init.revived) {
+    state.wbs = await listWbs(projectId)
+  }
+  state.workfaces = await listWorkfaces(projectId)
 }
 
 export async function refreshRecords(): Promise<void> {
@@ -148,20 +162,11 @@ export async function setScope(scope: AnalysisScope): Promise<void> {
   const plain: AnalysisScope = {
     level: scope.level,
     unitId: scope.unitId,
-    itemId: scope.itemId,
-    processId: scope.processId,
+    workfaceId: scope.workfaceId,
     chainage: scope.chainage
   }
   state.scope = plain
   await setKv('ui.scope', { projectId: state.currentProjectId, scope: plain })
-}
-
-export function scopeProcessIds(): Set<string> | null {
-  return scopedProcessIds(state.scope, processMap(), wbsMap())
-}
-
-export function scopeText(): string {
-  return scopeLabel(state.scope, wbsMap(), processMap())
 }
 
 export async function setOperator(id: string): Promise<void> {
@@ -186,7 +191,10 @@ export async function initApp(): Promise<void> {
   await refreshAll()
 
   const savedScope = await getKv<{ projectId: string; scope: AnalysisScope } | null>('ui.scope', null)
-  state.scope = savedScope && savedScope.projectId === state.currentProjectId ? savedScope.scope : { ...ALL_SCOPE }
+  state.scope =
+    savedScope && savedScope.projectId === state.currentProjectId
+      ? normalizeScope(savedScope.scope)
+      : { ...ALL_SCOPE }
 
   // 首次使用自动建一个默认操作人，避免录入时无法选人
   if (!state.operators.length) {
@@ -253,6 +261,15 @@ export function processMap(): Map<string, Process> {
 
 export function wbsMap(): Map<string, WbsNode> {
   return new Map(state.wbs.map((w) => [w.id, w]))
+}
+
+export function workfaceMap(): Map<string, Workface> {
+  return new Map(state.workfaces.map((w) => [w.id, w]))
+}
+
+/** 分项工程 → 工作面 id（含按名称回退，兼容迁移尚未落定的旧数据） */
+export function itemWorkfaceMap(): Map<string, string> {
+  return buildItemWorkfaceMap(state.wbs, state.workfaces)
 }
 
 export function currentProject(): Project | undefined {

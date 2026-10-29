@@ -227,7 +227,9 @@ async function createBenchProject() {
     const n = await seedHistoryRecords(row.id)
     await setProject(row.id)
     await afterChange('projects')
-    showToast(`已建立本标段项目：${tpl.units} 个单位工程、${tpl.processes} 道工序，补录 ${n} 条记录`)
+    showToast(
+      `已建立本标段项目：${tpl.units} 个单位工程、${tpl.workfaces} 个工作面、${tpl.processes} 道工序，补录 ${n} 条记录`
+    )
   } catch (err) {
     showToast(err instanceof Error ? err.message : '创建失败')
   } finally {

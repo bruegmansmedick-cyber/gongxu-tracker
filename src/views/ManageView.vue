@@ -9,9 +9,12 @@ import {
   deleteProcess,
   deleteProject,
   deleteWbsNode,
+  mergeWorkfaces,
+  rebindItemWorkface,
   saveProcess,
   saveProject,
   saveWbsNode,
+  saveWorkface,
   seedHistoryRecords,
   setProjectArchived
 } from '@/db'
@@ -20,11 +23,12 @@ import {
   filterStandardHoursRows,
   type StandardHoursFilter
 } from '@/core/standardFilter'
+import { buildItemWorkfaceMap } from '@/core/workface'
 import { HISTORY_ROWS } from '@/db/history'
-import type { Process, WbsLevel, WbsNode } from '@/types'
+import type { Process, WbsLevel, WbsNode, Workface } from '@/types'
 import { fmtHoursShort } from '@/core/time'
 
-const tab = ref<'structure' | 'standard'>('structure')
+const tab = ref<'structure' | 'standard' | 'workface'>('structure')
 const expanded = ref<Set<string>>(new Set())
 
 /** 参考用时最少样本数：少于 5 次不写参考值（宁缺勿假） */
@@ -149,9 +153,9 @@ async function submitEditor() {
       const res = await applyBenchTemplate(row.id)
       if (editor.importHistory) {
         const n = await seedHistoryRecords(row.id)
-        showToast(`已套用项目划分模板：${res.processes} 道工序，补录 ${n} 条历史记录`)
+        showToast(`已套用项目划分模板：${res.workfaces} 个工作面、${res.processes} 道工序，补录 ${n} 条历史记录`)
       } else {
-        showToast(`已套用项目划分模板：${res.processes} 道工序`)
+        showToast(`已套用项目划分模板：${res.workfaces} 个工作面、${res.processes} 道工序`)
       }
     }
     await setProject(row.id)
@@ -242,7 +246,7 @@ async function applyTemplate() {
   })
   const res = await applyBenchTemplate(state.currentProjectId)
   await afterChange('structure')
-  showToast(`已新增 ${res.units} 个单位工程、${res.processes} 道工序`)
+  showToast(`已新增 ${res.units} 个单位工程、${res.processes} 道工序、${res.workfaces} 个工作面`)
 }
 
 // ------------------------------------------------------------ 历史记录补录
@@ -487,6 +491,163 @@ async function saveStandards() {
   await afterChange('structure')
   showToast('标准用时已保存')
 }
+
+// ---------------------------------------------------------------- 工作面
+const itemFace = computed(() => buildItemWorkfaceMap(state.wbs, state.workfaces))
+
+interface FaceGroupRow {
+  workface: Workface
+  items: WbsNode[]
+}
+
+interface FaceGroup {
+  unit: WbsNode
+  faces: FaceGroupRow[]
+}
+
+const faceGroups = computed<FaceGroup[]>(() =>
+  units.value
+    .map((unit) => ({
+      unit,
+      faces: state.workfaces
+        .filter((w) => w.unitId === unit.id)
+        .sort((a, b) => a.sort - b.sort || a.name.localeCompare(b.name, 'zh'))
+        .map((workface) => ({
+          workface,
+          items: state.wbs
+            .filter((w) => w.level === 3 && itemFace.value.get(w.id) === workface.id)
+            .sort((a, b) => a.sort - b.sort)
+        }))
+    }))
+    .filter((group) => group.faces.length > 0)
+)
+
+const workfaceCount = computed(() => state.workfaces.length)
+const boundItemCount = computed(
+  () => state.wbs.filter((w) => w.level === 3 && Boolean(itemFace.value.get(w.id))).length
+)
+const unboundItems = computed(() =>
+  state.wbs.filter((w) => w.level === 3 && !itemFace.value.get(w.id)).sort((a, b) => a.sort - b.sort)
+)
+
+const showRename = ref(false)
+const renameTarget = ref<Workface | null>(null)
+const renameDraft = ref('')
+
+/** 分项默认收起：33 个工作面全展开会让页面很长 */
+const expandedFaces = ref<Set<string>>(new Set())
+
+function toggleFace(id: string) {
+  const next = new Set(expandedFaces.value)
+  if (next.has(id)) next.delete(id)
+  else next.add(id)
+  expandedFaces.value = next
+}
+
+const pickerMode = ref<'rebind' | 'merge' | ''>('')
+const rebindTarget = ref<WbsNode | null>(null)
+const mergeSource = ref<Workface | null>(null)
+
+/** 改名 */
+function openRename(face: Workface) {
+  renameTarget.value = face
+  renameDraft.value = face.name
+  showRename.value = true
+}
+
+async function submitRename() {
+  const face = renameTarget.value
+  if (!face) return
+  const name = renameDraft.value.trim()
+  if (!name) {
+    showToast('请填写工作面名称')
+    return
+  }
+  const clash = state.workfaces.some((w) => w.unitId === face.unitId && w.id !== face.id && w.name === name)
+  if (clash) {
+    showToast('同一单位工程下已有同名工作面，请换个名字')
+    return
+  }
+  await saveWorkface({ id: face.id, projectId: face.projectId, unitId: face.unitId, name, sort: face.sort })
+  showRename.value = false
+  renameTarget.value = null
+  await afterChange('structure')
+  showToast('工作面已改名')
+}
+
+/** 分项重绑：只能挂到同一单位工程下的工作面 */
+function openRebind(item: WbsNode) {
+  rebindTarget.value = item
+  mergeSource.value = null
+  pickerMode.value = 'rebind'
+}
+
+function openMerge(face: Workface) {
+  mergeSource.value = face
+  rebindTarget.value = null
+  pickerMode.value = 'merge'
+}
+
+function unitIdOfItemNode(item: WbsNode): string {
+  const div = item.parentId ? state.wbs.find((w) => w.id === item.parentId) : undefined
+  return div?.parentId ?? ''
+}
+
+const pickerFaces = computed<Workface[]>(() => {
+  if (pickerMode.value === 'rebind' && rebindTarget.value) {
+    const unitId = unitIdOfItemNode(rebindTarget.value)
+    return state.workfaces
+      .filter((w) => w.unitId === unitId && w.id !== itemFace.value.get(rebindTarget.value!.id))
+      .sort((a, b) => a.sort - b.sort)
+  }
+  if (pickerMode.value === 'merge' && mergeSource.value) {
+    return state.workfaces
+      .filter((w) => w.unitId === mergeSource.value!.unitId && w.id !== mergeSource.value!.id && !w.deletedAt)
+      .sort((a, b) => a.sort - b.sort)
+  }
+  return []
+})
+
+const pickerTitle = computed(() => {
+  if (pickerMode.value === 'rebind') return `把「${rebindTarget.value?.name ?? ''}」改挂到`
+  if (pickerMode.value === 'merge') return `把「${mergeSource.value?.name ?? ''}」合并到`
+  return ''
+})
+
+const pickerHint = computed(() =>
+  pickerMode.value === 'merge'
+    ? '合并后源工作面的分项全部迁到目标，源工作面被软删除；历史记录不改写，仍按分项归属。'
+    : '只改目录绑定，不改历史记录；同一单位工程内才能互挂。'
+)
+
+function onPickerShow(show: boolean) {
+  if (!show) pickerMode.value = ''
+}
+
+async function chooseFace(faceId: string) {
+  if (pickerMode.value === 'rebind' && rebindTarget.value) {
+    await rebindItemWorkface(rebindTarget.value.id, faceId)
+    pickerMode.value = ''
+    rebindTarget.value = null
+    await afterChange('structure')
+    showToast('已改挂工作面')
+    return
+  }
+  if (pickerMode.value === 'merge' && mergeSource.value) {
+    const source = mergeSource.value
+    const target = state.workfaces.find((w) => w.id === faceId)
+    if (!target) return
+    await showConfirmDialog({
+      title: '合并工作面',
+      message: `将把「${source.name}」下的分项全部改挂到「${target.name}」，并软删除「${source.name}」。历史记录不受影响，确定吗？`
+    })
+    const res = await mergeWorkfaces(source.id, faceId)
+    pickerMode.value = ''
+    mergeSource.value = null
+    await afterChange('structure')
+    showToast(`已合并，迁移 ${res.items} 个分项`)
+  }
+}
 </script>
 
 <template>
@@ -516,6 +677,7 @@ async function saveStandards() {
 
     <van-tabs v-model:active="tab" type="card">
       <van-tab title="工程结构" name="structure" />
+      <van-tab title="工作面" name="workface" />
       <van-tab title="标准用时" name="standard" />
     </van-tabs>
 
@@ -596,7 +758,7 @@ async function saveStandards() {
       </div>
     </template>
 
-    <template v-else>
+    <template v-else-if="tab === 'standard'">
       <div class="card standard-filter-card" style="margin-top: 12px">
         <van-search
           v-model="standardFilter.query"
@@ -673,6 +835,77 @@ async function saveStandards() {
       <van-button block type="primary" round @click="saveStandards">保存标准用时</van-button>
     </template>
 
+    <template v-else>
+      <div class="card" style="margin-top: 12px">
+        <div class="muted" style="line-height: 1.65">
+          工作面按<b>单位工程 + 分项名称最外层括号</b>自动建：同一洞室的开挖与支护算同一个工作面，
+          看板按它筛「单位工程 → 工作面 → 桩号」。改名、重绑、合并都只改目录绑定，<b>不改写历史记录</b>。
+        </div>
+        <div class="btn-row">
+          <span class="muted">{{ workfaceCount }} 个工作面 · 已绑 {{ boundItemCount }} 个分项</span>
+          <span v-if="unboundItems.length" class="clear-filter">{{ unboundItems.length }} 个分项未绑</span>
+        </div>
+      </div>
+
+      <van-empty v-if="!faceGroups.length" description="还没有工作面，套用模板或新建分项后会自动补建" image-size="64" />
+
+      <div v-for="group in faceGroups" :key="group.unit.id" class="card">
+        <div class="card-title">{{ group.unit.name }}<span class="sub">{{ group.faces.length }} 个工作面</span></div>
+        <div v-for="row in group.faces" :key="row.workface.id" class="face-block">
+          <div class="face-head" @click="toggleFace(row.workface.id)">
+            <van-icon :name="expandedFaces.has(row.workface.id) ? 'arrow-down' : 'arrow'" />
+            <div class="face-main">
+              <div class="face-name">{{ row.workface.name }}</div>
+              <div class="muted">{{ row.items.length }} 个分项 · 点开可重绑</div>
+            </div>
+            <div class="face-actions">
+              <button
+                type="button"
+                class="mini-btn"
+                :aria-label="`重命名工作面 ${row.workface.name}`"
+                @click.stop="openRename(row.workface)"
+              >
+                改名
+              </button>
+              <button
+                type="button"
+                class="mini-btn danger"
+                :disabled="group.faces.length < 2"
+                :aria-label="`合并工作面 ${row.workface.name}`"
+                @click.stop="openMerge(row.workface)"
+              >
+                合并
+              </button>
+            </div>
+          </div>
+          <div v-if="expandedFaces.has(row.workface.id)" class="face-items">
+            <div v-for="item in row.items" :key="item.id" class="face-item">
+              <span class="face-item-name">{{ item.name }}</span>
+              <button
+                type="button"
+                class="mini-btn"
+                :aria-label="`把 ${item.name} 改挂到其他工作面`"
+                @click="openRebind(item)"
+              >
+                重绑
+              </button>
+            </div>
+            <div v-if="!row.items.length" class="muted">这个工作面还没有分项</div>
+          </div>
+        </div>
+      </div>
+
+      <div v-if="unboundItems.length" class="card">
+        <div class="card-title">未绑工作面<span class="sub">下次加载会自动按名称补建</span></div>
+        <div v-for="item in unboundItems" :key="item.id" class="face-item">
+          <span class="face-item-name">{{ item.name }}</span>
+          <button type="button" class="mini-btn" :aria-label="`把 ${item.name} 挂到工作面`" @click="openRebind(item)">
+            挂载
+          </button>
+        </div>
+      </div>
+    </template>
+
     <div class="bottom-space" />
   </div>
 
@@ -701,6 +934,49 @@ async function saveStandards() {
           />
         </div>
         <van-empty v-if="!standardPickerOptions.length" description="没有可选项" image-size="60" />
+      </div>
+    </div>
+  </van-popup>
+
+  <van-popup v-model:show="showRename" round position="bottom">
+    <div class="standard-picker">
+      <div class="standard-picker-head">
+        <b>重命名工作面</b>
+        <span class="muted" @click="showRename = false">关闭</span>
+      </div>
+      <div style="padding: 12px 8px 0">
+        <van-field v-model="renameDraft" label="名称" placeholder="如 1#支洞" />
+        <div class="muted" style="padding: 6px 16px 0">
+          只改显示名，分项绑定与历史记录都不动；同名工作面不会被自动合并。
+        </div>
+        <div style="display: flex; gap: 10px; padding: 14px 16px">
+          <van-button block plain @click="showRename = false">取消</van-button>
+          <van-button block type="primary" @click="submitRename">保存</van-button>
+        </div>
+      </div>
+    </div>
+  </van-popup>
+
+  <van-popup :show="pickerMode !== ''" round position="bottom" :style="{ maxHeight: '70%' }" @update:show="onPickerShow">
+    <div class="standard-picker">
+      <div class="standard-picker-head">
+        <b>{{ pickerTitle }}</b>
+        <span class="muted" @click="pickerMode = ''">关闭</span>
+      </div>
+      <div class="muted" style="padding: 8px 16px 0; line-height: 1.6">{{ pickerHint }}</div>
+      <div class="standard-picker-body">
+        <button
+          v-for="face in pickerFaces"
+          :key="face.id"
+          type="button"
+          class="standard-picker-item as-button"
+          :aria-label="`选择工作面 ${face.name}`"
+          @click="chooseFace(face.id)"
+        >
+          <span>{{ face.name }}</span>
+          <van-icon name="arrow" />
+        </button>
+        <van-empty v-if="!pickerFaces.length" description="同一单位工程下没有其他工作面" image-size="60" />
       </div>
     </div>
   </van-popup>
@@ -906,5 +1182,98 @@ async function saveStandards() {
 .std-main {
   flex: 1;
   min-width: 0;
+}
+
+.face-block {
+  padding: 10px 0;
+  border-top: 1px solid #f4f5f7;
+}
+
+.face-block:first-of-type {
+  border-top: none;
+}
+
+.face-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.face-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.face-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+
+.face-actions {
+  display: flex;
+  gap: 8px;
+  flex-shrink: 0;
+}
+
+.mini-btn {
+  border: 1px solid #dfe4ea;
+  background: #f8f9fb;
+  border-radius: 999px;
+  padding: 5px 12px;
+  font-size: 12px;
+  color: #33404f;
+  font-family: inherit;
+}
+
+.mini-btn:disabled {
+  color: #b6bec8;
+  background: #fafbfc;
+}
+
+.mini-btn.danger {
+  color: #d14343;
+  border-color: #f3c9c9;
+  background: #fdf3f3;
+}
+
+.mini-btn:focus-visible,
+.standard-picker-item.as-button:focus-visible {
+  outline: 2px solid #1f6feb;
+  outline-offset: 2px;
+}
+
+.face-items {
+  margin-top: 8px;
+  padding-left: 8px;
+}
+
+.face-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px 0;
+  border-top: 1px dashed #f0f1f4;
+  font-size: 13px;
+  color: #4a5461;
+}
+
+.face-item:first-child {
+  border-top: none;
+}
+
+.face-item-name {
+  min-width: 0;
+}
+
+.standard-picker-item.as-button {
+  width: 100%;
+  border: none;
+  border-bottom: 1px solid #f4f5f7;
+  background: transparent;
+  text-align: left;
+  font-family: inherit;
 }
 </style>

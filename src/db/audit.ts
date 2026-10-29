@@ -17,7 +17,7 @@ export type AuditAction =
   | 'bulk-approved'
   | 'health'
 
-export type AuditEntity = 'record' | 'process' | 'wbs' | 'project' | 'operator' | 'system'
+export type AuditEntity = 'record' | 'process' | 'wbs' | 'workface' | 'project' | 'operator' | 'system'
 
 export interface AuditChange {
   field: string

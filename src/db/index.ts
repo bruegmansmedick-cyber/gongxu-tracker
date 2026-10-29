@@ -6,10 +6,12 @@ import type {
   Project,
   RecordsPayload,
   WbsLevel,
-  WbsNode
+  WbsNode,
+  Workface
 } from '@/types'
 import { buildTimeFields } from '@/core/compute'
 import { uid } from '@/core/id'
+import { planWorkfaceInit, workfaceIdOf, workfacesOfCatalog } from '@/core/workface'
 import { monthKey, todayStr } from '@/core/time'
 import { BENCH_TEMPLATE, faceOfItem, refHoursOf } from '@/db/seed'
 import { buildHistoryRecords, historyRecordIds } from '@/db/history'
@@ -108,7 +110,7 @@ export async function setProjectArchived(id: string, archived: 0 | 1): Promise<v
 export async function deleteProject(id: string): Promise<void> {
   const now = Date.now()
   const months = new Set<string>()
-  await db.transaction('rw', db.projects, db.wbs, db.processes, db.records, async () => {
+  await db.transaction('rw', db.projects, db.wbs, db.processes, db.records, db.workfaces, async () => {
     const project = await db.projects.get(id)
     if (project) await db.projects.put({ ...project, deletedAt: now, updatedAt: now })
     for (const row of await db.wbs.where('projectId').equals(id).toArray()) {
@@ -116,6 +118,9 @@ export async function deleteProject(id: string): Promise<void> {
     }
     for (const row of await db.processes.where('projectId').equals(id).toArray()) {
       await db.processes.put({ ...row, deletedAt: now, updatedAt: now })
+    }
+    for (const row of await db.workfaces.where('projectId').equals(id).toArray()) {
+      await db.workfaces.put({ ...row, deletedAt: now, updatedAt: now })
     }
     for (const row of await db.records.where('projectId').equals(id).toArray()) {
       if (!row.deletedAt) months.add(monthKey(row.date))
@@ -183,6 +188,7 @@ export async function saveWbsNode(input: {
   unit?: string
   designQty?: number
   note?: string
+  workfaceId?: string
 }): Promise<WbsNode> {
   const now = Date.now()
   const existing = input.id ? await db.wbs.get(input.id) : undefined
@@ -199,6 +205,8 @@ export async function saveWbsNode(input: {
         unit: input.unit,
         designQty: input.designQty,
         note: input.note ?? existing.note,
+        // 未显式传入时保留原绑定，避免编辑名称把工作面弄丢
+        workfaceId: input.workfaceId ?? existing.workfaceId,
         updatedAt: now
       }
     : {
@@ -211,6 +219,7 @@ export async function saveWbsNode(input: {
         unit: input.unit,
         designQty: input.designQty,
         note: input.note,
+        workfaceId: input.workfaceId,
         updatedAt: now
       }
   await db.wbs.put(row)
@@ -245,10 +254,19 @@ export async function deleteWbsNode(id: string, withRecords = true): Promise<voi
     all.filter((n) => n.parentId === nid).forEach((n) => walk(n.id))
   }
   walk(id)
-  await db.transaction('rw', db.wbs, db.processes, db.records, async () => {
+  await db.transaction('rw', db.wbs, db.processes, db.records, db.workfaces, async () => {
     for (const nid of ids) {
       const n = await db.wbs.get(nid)
       if (n) await db.wbs.put({ ...n, deletedAt: now, updatedAt: now })
+    }
+    // 删单位工程时，把它名下的工作面一并软删除，避免留下悬空工作面
+    if (node.level === 1) {
+      const faces = await db.workfaces.where('projectId').equals(node.projectId).toArray()
+      for (const wf of faces) {
+        if (wf.unitId === id && !wf.deletedAt) {
+          await db.workfaces.put({ ...wf, deletedAt: now, updatedAt: now })
+        }
+      }
     }
     const procs = await db.processes.where('projectId').equals(node.projectId).toArray()
     const procIds = procs.filter((p) => ids.includes(p.itemId)).map((p) => p.id)
@@ -274,6 +292,155 @@ export async function deleteWbsNode(id: string, withRecords = true): Promise<voi
     entityId: id,
     summary: `删除结构「${node.name}」（含下级 ${ids.length - 1} 个节点${withRecords ? '及对应记录' : ''}）`
   })
+}
+
+// ------------------------------------------------------------------ 工作面
+
+export async function listWorkfaces(projectId: string, includeDeleted = false): Promise<Workface[]> {
+  const rows = await db.workfaces.where('projectId').equals(projectId).toArray()
+  return rows
+    .filter((r) => includeDeleted || !r.deletedAt)
+    .sort((a, b) => a.unitId.localeCompare(b.unitId) || a.sort - b.sort)
+}
+
+export async function saveWorkface(input: {
+  id?: string
+  projectId: string
+  unitId: string
+  name: string
+  sort?: number
+}): Promise<Workface> {
+  const now = Date.now()
+  const name = input.name.trim()
+  const existing = input.id ? await db.workfaces.get(input.id) : undefined
+  let sort = input.sort ?? existing?.sort ?? 0
+  if (!existing && input.sort === undefined) {
+    const siblings = await db.workfaces.where('projectId').equals(input.projectId).toArray()
+    const same = siblings.filter((s) => s.unitId === input.unitId && !s.deletedAt)
+    sort = same.length ? Math.max(...same.map((s) => s.sort)) + 1 : 1
+  }
+  const row: Workface = existing
+    ? { ...existing, name, sort, deletedAt: undefined, mergedInto: undefined, updatedAt: now }
+    : {
+        id: input.id ?? workfaceIdOf(input.projectId, input.unitId, name),
+        projectId: input.projectId,
+        unitId: input.unitId,
+        name,
+        sort,
+        updatedAt: now
+      }
+  await db.workfaces.put(row)
+  await markPending()
+  await logAudit({
+    action: existing ? 'update' : 'create',
+    entity: 'workface',
+    entityId: row.id,
+    summary: `工作面「${existing?.name ?? row.name}」${existing ? (existing.name === name ? '修改' : `改名为「${name}」`) : '新增'}`
+  })
+  return row
+}
+
+/** 把分项工程改挂到另一个工作面 */
+export async function rebindItemWorkface(itemId: string, workfaceId: string): Promise<void> {
+  const item = await db.wbs.get(itemId)
+  if (!item || item.level !== 3) return
+  if (item.workfaceId === workfaceId) return
+  const target = await db.workfaces.get(workfaceId)
+  if (!target || target.deletedAt) return
+  // 工作面属于单位工程：跨单位工程改挂会把看板范围弄乱，直接拒绝
+  const division = item.parentId ? await db.wbs.get(item.parentId) : undefined
+  const unitId = division?.parentId ?? ''
+  if (unitId && target.unitId !== unitId) return
+  await db.wbs.put({ ...item, workfaceId, updatedAt: Date.now() })
+  await markPending()
+  await logAudit({
+    action: 'update',
+    entity: 'wbs',
+    entityId: item.id,
+    summary: `分项「${item.name}」改挂工作面「${target.name}」`
+  })
+}
+
+/**
+ * 合并两个工作面：把源工作面的分项全部迁到目标，再软删除源工作面。
+ * 历史记录不直接绑定工作面，因此不会被改写；只留 mergedInto 供旧绑定继续解析到目标。
+ */
+export async function mergeWorkfaces(sourceId: string, targetId: string): Promise<{ items: number }> {
+  if (sourceId === targetId) return { items: 0 }
+  const now = Date.now()
+  const [source, target] = await Promise.all([db.workfaces.get(sourceId), db.workfaces.get(targetId)])
+  if (!source || !target || source.deletedAt || target.deletedAt) return { items: 0 }
+  if (source.projectId !== target.projectId) return { items: 0 }
+  let items = 0
+  await db.transaction('rw', db.wbs, db.workfaces, async () => {
+    const rows = await db.wbs.where('projectId').equals(source.projectId).toArray()
+    for (const row of rows) {
+      if (row.workfaceId === sourceId && !row.deletedAt) {
+        await db.wbs.put({ ...row, workfaceId: targetId, updatedAt: now })
+        items += 1
+      }
+    }
+    await db.workfaces.put({ ...source, deletedAt: now, mergedInto: targetId, updatedAt: now })
+  })
+  await markPending()
+  await logAudit({
+    action: 'update',
+    entity: 'workface',
+    entityId: sourceId,
+    summary: `合并工作面「${source.name}」到「${target.name}」（迁移 ${items} 个分项）`
+  })
+  return { items }
+}
+
+export interface WorkfaceInitResult {
+  created: number
+  bound: number
+  revived: number
+}
+
+/**
+ * 按单位工程 + 分项名称补建工作面并绑定分项。
+ * 幂等：已绑定 / 已存在同名工作面时不会重复创建，也不会覆盖人工改名与重绑。
+ */
+export async function ensureWorkfaces(projectId: string): Promise<WorkfaceInitResult> {
+  if (!projectId) return { created: 0, bound: 0, revived: 0 }
+  const [wbsRows, workfaces] = await Promise.all([
+    db.wbs.where('projectId').equals(projectId).toArray(),
+    db.workfaces.where('projectId').equals(projectId).toArray()
+  ])
+  const active = wbsRows.filter((r) => !r.deletedAt)
+  const plan = planWorkfaceInit({
+    projectId,
+    units: active.filter((r) => r.level === 1),
+    divisions: active.filter((r) => r.level === 2),
+    items: active.filter((r) => r.level === 3),
+    workfaces
+  })
+  if (!plan.create.length && !plan.bind.length && !plan.revive.length) {
+    return { created: 0, bound: 0, revived: 0 }
+  }
+  const now = Date.now()
+  await db.transaction('rw', db.wbs, db.workfaces, async () => {
+    if (plan.create.length) await db.workfaces.bulkPut(plan.create)
+    for (const id of plan.revive) {
+      const row = await db.workfaces.get(id)
+      if (row) await db.workfaces.put({ ...row, deletedAt: undefined, mergedInto: undefined, updatedAt: now })
+    }
+    for (const row of plan.bind) {
+      const item = await db.wbs.get(row.itemId)
+      if (item) await db.wbs.put({ ...item, workfaceId: row.workfaceId, updatedAt: now })
+    }
+  })
+  await markPending()
+  await logAudit({
+    action: 'seed',
+    entity: 'workface',
+    entityId: projectId,
+    summary: `自动初始化工作面：新建 ${plan.create.length} 个、绑定 ${plan.bind.length} 个分项${
+      plan.revive.length ? `、复用 ${plan.revive.length} 个` : ''
+    }`
+  })
+  return { created: plan.create.length, bound: plan.bind.length, revived: plan.revive.length }
 }
 
 export async function saveProcess(input: {
@@ -381,7 +548,12 @@ export async function deleteProcess(id: string, withRecords = true): Promise<voi
  * 节点与工序都带固定 id（由项目 id + 模板 key 推导），因此重复套用不会产生重复数据，
  * 也保证历史记录补录时能对应到同一批工序。
  */
-export async function applyBenchTemplate(projectId: string): Promise<{ units: number; items: number; processes: number }> {
+export async function applyBenchTemplate(projectId: string): Promise<{
+  units: number
+  items: number
+  processes: number
+  workfaces: number
+}> {
   let unitCount = 0
   let itemCount = 0
   let processCount = 0
@@ -437,7 +609,8 @@ export async function applyBenchTemplate(projectId: string): Promise<{ units: nu
       }
     }
   }
-  return { units: unitCount, items: itemCount, processes: processCount }
+  const wf = await ensureWorkfaces(projectId)
+  return { units: unitCount, items: itemCount, processes: processCount, workfaces: wf.created }
 }
 
 /** 补录三份循环作业 Word 里的历史记录（幂等，可重复执行） */
@@ -625,11 +798,12 @@ export async function allRecords(): Promise<ProcessRecord[]> {
 // ----------------------------------------------------------- 同步所需数据包
 
 export async function readCatalogPayload(): Promise<CatalogPayload> {
-  const [projects, wbs, processes, operators] = await Promise.all([
+  const [projects, wbs, processes, operators, workfaces] = await Promise.all([
     db.projects.toArray(),
     db.wbs.toArray(),
     db.processes.toArray(),
-    db.operators.toArray()
+    db.operators.toArray(),
+    db.workfaces.toArray()
   ])
   return {
     updatedAt: Math.max(
@@ -637,21 +811,26 @@ export async function readCatalogPayload(): Promise<CatalogPayload> {
       ...projects.map((r) => r.updatedAt),
       ...wbs.map((r) => r.updatedAt),
       ...processes.map((r) => r.updatedAt),
-      ...operators.map((r) => r.updatedAt)
+      ...operators.map((r) => r.updatedAt),
+      ...workfaces.map((r) => r.updatedAt)
     ),
     projects,
     wbs,
     processes,
-    operators
+    operators,
+    workfaces
   }
 }
 
 export async function writeCatalogPayload(payload: CatalogPayload): Promise<void> {
-  await db.transaction('rw', db.projects, db.wbs, db.processes, db.operators, async () => {
+  await db.transaction('rw', db.projects, db.wbs, db.processes, db.operators, db.workfaces, async () => {
     if (payload.projects?.length) await db.projects.bulkPut(payload.projects)
     if (payload.wbs?.length) await db.wbs.bulkPut(payload.wbs)
     if (payload.processes?.length) await db.processes.bulkPut(payload.processes)
     if (payload.operators?.length) await db.operators.bulkPut(payload.operators)
+    // 旧云端目录 / 旧备份没有 workfaces 字段：跳过即可，加载后由 ensureWorkfaces 幂等补建
+    const faces = workfacesOfCatalog(payload)
+    if (faces.length) await db.workfaces.bulkPut(faces)
   })
 }
 
@@ -737,15 +916,20 @@ export async function restoreImportSnapshot(): Promise<boolean> {
 }
 
 export async function wipeLocalData(): Promise<void> {
-  await db.transaction('rw', db.projects, db.wbs, db.processes, db.records, db.operators, async () => {
-    await Promise.all([
-      db.projects.clear(),
-      db.wbs.clear(),
-      db.processes.clear(),
-      db.records.clear(),
-      db.operators.clear()
-    ])
-  })
+  await db.transaction(
+    'rw',
+    [db.projects, db.wbs, db.processes, db.records, db.operators, db.workfaces],
+    async () => {
+      await Promise.all([
+        db.projects.clear(),
+        db.wbs.clear(),
+        db.processes.clear(),
+        db.records.clear(),
+        db.operators.clear(),
+        db.workfaces.clear()
+      ])
+    }
+  )
   await markPending()
 }
 

@@ -8,10 +8,11 @@
  * 纯函数，不碰 DOM：几何与配色都在这里算，组件只负责画。
  */
 import { isActive } from '@/core/compute'
-import { shortItemLabel, shortSpot } from '@/core/scope'
+import { shortItemLabel, shortSpot, workfaceIdOfItem } from '@/core/scope'
 import { recordChainage, shortChainageText } from '@/core/chainage'
+import { workfaceLabel } from '@/core/workface'
 import { hhmmToMinutes } from '@/core/time'
-import type { ISODate, Process, ProcessRecord, WbsNode } from '@/types'
+import type { ISODate, Process, ProcessRecord, WbsNode, Workface } from '@/types'
 
 /** 一天的总分钟数：整圈 */
 export const DAY_MINUTES = 1440
@@ -41,7 +42,7 @@ export interface RingSegment {
   name: string
   /** 分项工程全名 */
   itemName: string
-  /** 工作面短名，如 "1#支洞" */
+  /** 工作面短名，如 "1#支洞"（没有工作面时退回分项短名） */
   itemShort: string
   /** 简洁桩号，如 "545-548"；历史无桩号时为空 */
   chainage: string
@@ -92,8 +93,11 @@ export interface DayRingInput {
   records: ProcessRecord[]
   processById: Map<string, Process>
   wbsById: Map<string, WbsNode>
-  /** true = 按工序着色（选定分项工程时）；false = 按分项工程/工作面着色 */
+  /** true = 按工序着色（选定单一工作面时）；false = 按工作面着色 */
   byProcess: boolean
+  /** 分项 → 工作面（缺省时按节点上的 workfaceId） */
+  itemWorkface?: Map<string, string>
+  workfaceById?: Map<string, Workface>
 }
 
 function endMinuteOf(startMin: number, endTime: string): number {
@@ -137,6 +141,9 @@ export function buildDayRing(input: DayRingInput): DayRingData {
     if (!p) return
     const item = input.wbsById.get(p.itemId)
     const itemName = item?.name ?? '未归类'
+    const wfId = workfaceIdOfItem(p.itemId, input.wbsById, input.itemWorkface)
+    const faceName = wfId && input.workfaceById ? workfaceLabel(wfId, input.workfaceById) : ''
+    const itemShort = faceName || shortSpot(itemName)
     const startMin = hhmmToMinutes(r.startTime)
     const endMin = endMinuteOf(startMin, r.endTime)
     const crossMidnight = endMin > DAY_MINUTES
@@ -146,9 +153,10 @@ export function buildDayRing(input: DayRingInput): DayRingData {
       itemId: p.itemId,
       name: p.name,
       itemName,
-      itemShort: shortSpot(itemName),
+      itemShort,
       chainage: shortChainageText(recordChainage(r)),
-      colorKey: input.byProcess ? p.name : shortItemLabel(itemName),
+      // 有工作面就按工作面着色；旧数据没有工作面时退回"分项短名"（1#支洞开挖 / 1#支洞支护）
+      colorKey: input.byProcess ? p.name : faceName || shortItemLabel(itemName),
       color: RING_PALETTE[0],
       startMin,
       endMin,

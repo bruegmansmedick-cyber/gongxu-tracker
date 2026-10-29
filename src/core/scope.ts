@@ -1,27 +1,48 @@
 /**
  * 分析范围：决定看板 / 明细页"在看哪一块工程"。
- * 全部 → 单位工程 → 分项工程（可再筛工序）。
- * 所有图表都先用它把记录过滤一遍，避免把并行施工的工作面混在一起算。
+ * 全部 → 单位工程 → 工作面（+ 可选桩号）。
+ *
+ * 为什么不再按分项 / 工序筛：一个洞室里开挖、支护是同一个工作面的两道循环，
+ * 分项工程只是项目划分的记账口径；看板上按工作面看才不会被拆成两半。
+ * 工序级明细仍可在明细页搜索。
+ *
+ * 记录 → 工序 → 分项工程 → 工作面：记录不直接挂工作面，因此历史数据不需要改写。
  */
-import type { Process, ProcessRecord, WbsNode } from '@/types'
+import type { Process, ProcessRecord, WbsNode, Workface } from '@/types'
 import { baselineHoursOf, isActive } from '@/core/compute'
-import { chainageOverlaps, mergeChainages, recordChainage, shortChainageText } from '@/core/chainage'
+import { chainageOverlaps, mergeChainages, parseChainageRange, recordChainage, shortChainageText } from '@/core/chainage'
+import { chainageKey, chainageOptionLabel, workfaceLabel } from '@/core/workface'
 
-export type ScopeLevel = 'all' | 'unit' | 'item'
+export type ScopeLevel = 'all' | 'unit' | 'workface'
 
 export interface AnalysisScope {
   level: ScopeLevel
   /** level = 'unit' 时的单位工程 id */
   unitId?: string
-  /** level = 'item' 时的分项工程 id */
-  itemId?: string
-  /** 选定分项工程后可再筛具体工序，留空表示全部工序 */
-  processId?: string
+  /** level = 'workface' 时的工作面 id */
+  workfaceId?: string
   /** 按桩号区间筛选；留空表示全部桩号 */
   chainage?: string
 }
 
 export const ALL_SCOPE: AnalysisScope = { level: 'all' }
+
+/**
+ * 归一化本机保存的范围。旧版本可能存着 level='item' + itemId/processId，
+ * 这两个入口已经取消，直接退回"全部工程"，避免打开看板时是一块空数据。
+ */
+export function normalizeScope(raw: unknown): AnalysisScope {
+  if (!raw || typeof raw !== 'object') return { ...ALL_SCOPE }
+  const obj = raw as Record<string, unknown>
+  const chainage = typeof obj.chainage === 'string' && obj.chainage.trim() ? obj.chainage.trim() : undefined
+  if (obj.level === 'unit' && typeof obj.unitId === 'string' && obj.unitId) {
+    return { level: 'unit', unitId: obj.unitId, chainage }
+  }
+  if (obj.level === 'workface' && typeof obj.workfaceId === 'string' && obj.workfaceId) {
+    return { level: 'workface', workfaceId: obj.workfaceId, chainage }
+  }
+  return { ...ALL_SCOPE }
+}
 
 /** 某个分项工程属于哪个单位工程（分项 → 分部 → 单位） */
 export function unitIdOfItem(itemId: string, wbsById: Map<string, WbsNode>): string {
@@ -30,11 +51,23 @@ export function unitIdOfItem(itemId: string, wbsById: Map<string, WbsNode>): str
   return div?.parentId ?? ''
 }
 
+/** 某个分项工程属于哪个工作面：优先用绑定表，其次看节点上的 workfaceId */
+export function workfaceIdOfItem(
+  itemId: string,
+  wbsById: Map<string, WbsNode>,
+  itemWorkface?: Map<string, string>
+): string {
+  const fromMap = itemWorkface?.get(itemId)
+  if (fromMap) return fromMap
+  return wbsById.get(itemId)?.workfaceId ?? ''
+}
+
 export function filterByScope(
   records: ProcessRecord[],
   scope: AnalysisScope,
   processById: Map<string, Process>,
-  wbsById: Map<string, WbsNode>
+  wbsById: Map<string, WbsNode>,
+  itemWorkface?: Map<string, string>
 ): ProcessRecord[] {
   const rows = records.filter(isActive)
   let scoped = rows
@@ -44,32 +77,31 @@ export function filterByScope(
       if (!p) return false
       return unitIdOfItem(p.itemId, wbsById) === scope.unitId
     })
-  } else if (scope.level === 'item' && scope.itemId) {
+  } else if (scope.level === 'workface' && scope.workfaceId) {
     scoped = rows.filter((r) => {
       const p = processById.get(r.processId)
       if (!p) return false
-      if (p.itemId !== scope.itemId) return false
-      if (scope.processId && p.id !== scope.processId) return false
-      return true
+      return workfaceIdOfItem(p.itemId, wbsById, itemWorkface) === scope.workfaceId
     })
   }
   if (!scope.chainage) return scoped
   return scoped.filter((r) => chainageOverlaps(recordChainage(r), scope.chainage))
 }
 
-/** 范围内的工序 id 集合；null 表示不限制 */
-export function scopedProcessIds(
+/** 范围内的分项工程 id 集合；null 表示不限制 */
+export function scopedItemIds(
   scope: AnalysisScope,
-  processById: Map<string, Process>,
-  wbsById: Map<string, WbsNode>
+  wbsById: Map<string, WbsNode>,
+  itemWorkface?: Map<string, string>
 ): Set<string> | null {
   if (scope.level === 'all') return null
   const out = new Set<string>()
-  processById.forEach((p) => {
+  wbsById.forEach((node) => {
+    if (node.level !== 3 || node.deletedAt) return
     if (scope.level === 'unit') {
-      if (scope.unitId && unitIdOfItem(p.itemId, wbsById) === scope.unitId) out.add(p.id)
-    } else if (scope.itemId && p.itemId === scope.itemId) {
-      if (!scope.processId || p.id === scope.processId) out.add(p.id)
+      if (scope.unitId && unitIdOfItem(node.id, wbsById) === scope.unitId) out.add(node.id)
+    } else if (scope.workfaceId && workfaceIdOfItem(node.id, wbsById, itemWorkface) === scope.workfaceId) {
+      out.add(node.id)
     }
   })
   return out
@@ -78,20 +110,20 @@ export function scopedProcessIds(
 export function scopeLabel(
   scope: AnalysisScope,
   wbsById: Map<string, WbsNode>,
-  processById?: Map<string, Process>
+  workfaceById?: Map<string, Workface>
 ): string {
   let label = '全部工程'
   if (scope.level === 'unit') label = wbsById.get(scope.unitId ?? '')?.name ?? '未知单位工程'
-  if (scope.level === 'item') {
-    const item = wbsById.get(scope.itemId ?? '')?.name ?? '未知分项工程'
-    const proc = scope.processId ? processById?.get(scope.processId) : undefined
-    label = proc ? `${item} · ${proc.name}` : item
+  if (scope.level === 'workface') {
+    label = workfaceById
+      ? workfaceLabel(scope.workfaceId ?? '', workfaceById)
+      : wbsById.get(scope.workfaceId ?? '')?.name ?? '未知工作面'
   }
   if (scope.chainage) label += ` · 桩号 ${shortChainageText(scope.chainage)}`
   return label
 }
 
-/** 把"土石方洞挖（导流洞1#施工支洞）"压成"1#支洞开挖"，用于图例 / 饼图 */
+/** 把"土石方洞挖（导流洞1#施工支洞）"压成"1#支洞"，用于图例 / 饼图 */
 export function shortSpot(itemName: string): string {
   const m = /（(.+?)）/.exec(itemName)
   const spot = m ? m[1] : itemName
@@ -130,17 +162,21 @@ export interface ItemAgg {
   itemName: string
   shortName: string
   unitName: string
+  workfaceId: string
+  workfaceName: string
   count: number
   actualHours: number
   baselineHours: number
   chainages: string[]
 }
 
-/** 按分项工程汇总工时（整体视图的堆叠柱与饼图用） */
+/** 按分项工程汇总工时 */
 export function aggregateByItem(
   records: ProcessRecord[],
   processById: Map<string, Process>,
-  wbsById: Map<string, WbsNode>
+  wbsById: Map<string, WbsNode>,
+  itemWorkface?: Map<string, string>,
+  workfaceById?: Map<string, Workface>
 ): ItemAgg[] {
   const map = new Map<string, ItemAgg>()
   const chainageValues = new Map<string, string[]>()
@@ -150,6 +186,7 @@ export function aggregateByItem(
     const item = wbsById.get(p.itemId)
     const div = item?.parentId ? wbsById.get(item.parentId) : undefined
     const unit = div?.parentId ? wbsById.get(div.parentId) : undefined
+    const wfId = workfaceIdOfItem(p.itemId, wbsById, itemWorkface)
     const cur =
       map.get(p.itemId) ??
       ({
@@ -157,6 +194,8 @@ export function aggregateByItem(
         itemName: item?.name ?? '未归类',
         shortName: shortItemLabel(item?.name ?? '未归类'),
         unitName: unit?.name ?? '',
+        workfaceId: wfId,
+        workfaceName: workfaceById ? workfaceLabel(wfId, workfaceById) : '',
         count: 0,
         actualHours: 0,
         baselineHours: 0,
@@ -180,6 +219,109 @@ export function aggregateByItem(
   return out.sort((a, b) => b.actualHours - a.actualHours)
 }
 
+export interface WorkfaceAgg {
+  workfaceId: string
+  workfaceName: string
+  unitName: string
+  count: number
+  actualHours: number
+  chainages: string[]
+}
+
+/** 按工作面汇总工时（看板主图 / 图例用） */
+export function aggregateByWorkface(
+  records: ProcessRecord[],
+  processById: Map<string, Process>,
+  wbsById: Map<string, WbsNode>,
+  itemWorkface: Map<string, string>,
+  workfaceById: Map<string, Workface>
+): WorkfaceAgg[] {
+  const map = new Map<string, WorkfaceAgg>()
+  const chainageValues = new Map<string, string[]>()
+  records.filter(isActive).forEach((r) => {
+    const p = processById.get(r.processId)
+    if (!p) return
+    const wfId = workfaceIdOfItem(p.itemId, wbsById, itemWorkface)
+    const wf = workfaceById.get(wfId)
+    const unit = wbsById.get(wf?.unitId ?? '')
+    const cur =
+      map.get(wfId) ??
+      ({
+        workfaceId: wfId,
+        workfaceName: workfaceLabel(wfId, workfaceById),
+        unitName: unit?.name ?? '',
+        count: 0,
+        actualHours: 0,
+        chainages: []
+      } satisfies WorkfaceAgg)
+    cur.count += 1
+    cur.actualHours += Number.isFinite(r.hours) ? r.hours : 0
+    const chain = recordChainage(r)
+    if (chain) {
+      const values = chainageValues.get(wfId) ?? []
+      values.push(chain)
+      chainageValues.set(wfId, values)
+    }
+    map.set(wfId, cur)
+  })
+  const out = Array.from(map.values())
+  out.forEach((row) => {
+    row.chainages = mergeChainages(chainageValues.get(row.workfaceId) ?? []).ranges.map(shortChainageText)
+  })
+  return out.sort((a, b) => b.actualHours - a.actualHours)
+}
+
+export interface ChainageOption {
+  /** workfaceId|规范化桩号 —— 桩号身份，不能只用短桩号去重 */
+  key: string
+  workfaceId: string
+  workfaceName: string
+  /** 规范化后的完整桩号，如 0+545~0+548 */
+  text: string
+  /** 手机端短桩号，如 545-548 */
+  shortText: string
+  /** 按钮文案，如「1#支洞 · 545-548」 */
+  label: string
+  startM: number
+  count: number
+}
+
+/** 当前范围里出现过的桩号，按工作面 + 规范化桩号去重，按里程排序 */
+export function chainageOptionsOf(input: {
+  records: ProcessRecord[]
+  processById: Map<string, Process>
+  wbsById: Map<string, WbsNode>
+  itemWorkface: Map<string, string>
+  workfaceById: Map<string, Workface>
+}): ChainageOption[] {
+  const map = new Map<string, ChainageOption>()
+  input.records.filter(isActive).forEach((r) => {
+    const parsed = parseChainageRange(recordChainage(r))
+    if (!parsed) return
+    const p = input.processById.get(r.processId)
+    if (!p) return
+    const wfId = workfaceIdOfItem(p.itemId, input.wbsById, input.itemWorkface)
+    const key = chainageKey(wfId, parsed.text)
+    const cur = map.get(key)
+    if (cur) {
+      cur.count += 1
+      return
+    }
+    const name = workfaceLabel(wfId, input.workfaceById)
+    map.set(key, {
+      key,
+      workfaceId: wfId,
+      workfaceName: name,
+      text: parsed.text,
+      shortText: parsed.shortText,
+      label: chainageOptionLabel(name, parsed.shortText),
+      startM: parsed.startM,
+      count: 1
+    })
+  })
+  return Array.from(map.values()).sort((a, b) => a.startM - b.startM || a.label.localeCompare(b.label, 'zh'))
+}
+
 export interface StackedSeries {
   name: string
   data: number[]
@@ -192,15 +334,17 @@ export interface StackedTrend {
 }
 
 /**
- * 把若干周期的工时按"分项工程"或"工序"拆成堆叠序列（最多 maxGroups 个，其余并入"其他"）。
+ * 把若干周期的工时按"工作面 / 分项工程 / 工序"拆成堆叠序列
+ * （最多 maxGroups 个，其余并入"其他"）。
  */
 export function stackedTrend(
   records: ProcessRecord[],
   processById: Map<string, Process>,
   wbsById: Map<string, WbsNode>,
   periods: Array<{ from: string; to: string; label: string }>,
-  groupBy: 'item' | 'process',
-  maxGroups = 6
+  groupBy: 'workface' | 'item' | 'process',
+  maxGroups = 6,
+  lookups?: { itemWorkface: Map<string, string>; workfaceById: Map<string, Workface> }
 ): StackedTrend {
   const labels = periods.map((p) => p.label)
   const groupNames = new Map<string, string>()
@@ -211,10 +355,18 @@ export function stackedTrend(
       .forEach((r) => {
         const p = processById.get(r.processId)
         if (!p) return
-        const key = groupBy === 'item' ? p.itemId : p.id
+        let key = p.id
+        if (groupBy === 'item') key = p.itemId
+        else if (groupBy === 'workface') key = workfaceIdOfItem(p.itemId, wbsById, lookups?.itemWorkface) || 'unknown'
         if (!groupNames.has(key)) {
           const item = wbsById.get(p.itemId)
-          groupNames.set(key, groupBy === 'item' ? shortItemLabel(item?.name ?? '未归类') : p.name)
+          if (groupBy === 'item') groupNames.set(key, shortItemLabel(item?.name ?? '未归类'))
+          else if (groupBy === 'workface') {
+            groupNames.set(
+              key,
+              lookups?.workfaceById ? workfaceLabel(key, lookups.workfaceById) : shortItemLabel(item?.name ?? '未归类')
+            )
+          } else groupNames.set(key, p.name)
         }
         cell.set(key, (cell.get(key) ?? 0) + (Number.isFinite(r.hours) ? r.hours : 0))
       })

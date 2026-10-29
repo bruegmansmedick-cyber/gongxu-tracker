@@ -18,6 +18,7 @@ import {
 } from '@/db'
 import { monthKey } from '@/core/time'
 import { mergeSyncable, normalizeForCompare } from '@/sync/merge'
+import { workfacesOfCatalog } from '@/core/workface'
 import { readAuditPayload, writeAuditPayload, type AuditPayload } from '@/db/audit'
 import { listAudit, logAudit } from '@/db/audit'
 import {
@@ -209,17 +210,29 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
       const wMerge = mergeSyncable(localCatalog.wbs ?? [], remoteCatalog?.wbs ?? [])
       const cMerge = mergeSyncable(localCatalog.processes ?? [], remoteCatalog?.processes ?? [])
       const oMerge = mergeSyncable(localCatalog.operators ?? [], remoteCatalog?.operators ?? [])
+      // 工作面是后加的字段：旧云端目录没有时不报错，按空集合合并即可
+      const fMerge = mergeSyncable(localCatalog.workfaces ?? [], workfacesOfCatalog(remoteCatalog))
       const mergedCatalog: CatalogPayload = {
         updatedAt: Math.max(localCatalog.updatedAt, remoteCatalog?.updatedAt ?? 0, Date.now()),
         projects: normalizeForCompare(pMerge.rows),
         wbs: normalizeForCompare(wMerge.rows),
         processes: normalizeForCompare(cMerge.rows),
-        operators: normalizeForCompare(oMerge.rows)
+        operators: normalizeForCompare(oMerge.rows),
+        workfaces: normalizeForCompare(fMerge.rows)
       }
       const catalogRemoteDiffers =
-        !remoteCatalog || pMerge.remoteDiffers || wMerge.remoteDiffers || cMerge.remoteDiffers || oMerge.remoteDiffers
+        !remoteCatalog ||
+        pMerge.remoteDiffers ||
+        wMerge.remoteDiffers ||
+        cMerge.remoteDiffers ||
+        oMerge.remoteDiffers ||
+        fMerge.remoteDiffers
       const catalogLocalDiffers =
-        pMerge.localDiffers || wMerge.localDiffers || cMerge.localDiffers || oMerge.localDiffers
+        pMerge.localDiffers ||
+        wMerge.localDiffers ||
+        cMerge.localDiffers ||
+        oMerge.localDiffers ||
+        fMerge.localDiffers
       if (catalogLocalDiffers) await writeCatalogPayload(mergedCatalog)
       if (catalogRemoteDiffers) {
         if (payloadSize(mergedCatalog) > MAX_FILE_BYTES) {
