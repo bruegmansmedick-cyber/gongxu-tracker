@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import {
   buildItemWorkfaceMap,
+  canMergeWorkfaces,
   chainageKey,
   chainageOptionLabel,
   hash32,
@@ -251,5 +252,30 @@ describe('桩号身份与旧目录兼容', () => {
     expect(workfacesOfCatalog({ workfaces: 'bad' })).toEqual([])
     expect(workfacesOfCatalog({ workfaces: [{ id: 'wf1', name: '1#支洞' }] })).toHaveLength(1)
     expect(workfacesOfCatalog({ workfaces: [null, { noId: 1 }, { id: 'wf2' }] })).toHaveLength(1)
+  })
+})
+
+describe('工作面合并的前置校验', () => {
+  const base = (over: Partial<Workface> = {}): Workface => ({
+    id: 'a',
+    projectId: 'prj',
+    unitId: 'u1',
+    name: '1#支洞',
+    sort: 1,
+    updatedAt: 1,
+    ...over
+  })
+
+  it('同项目同单位工程、都未删除才能合并', () => {
+    expect(canMergeWorkfaces(base(), base({ id: 'b', name: '2#支洞' }))).toBe(true)
+  })
+
+  it('跨单位工程、跨项目、自己合并自己、任一方已删除都拒绝', () => {
+    expect(canMergeWorkfaces(base(), base({ id: 'b', unitId: 'u2' }))).toBe(false)
+    expect(canMergeWorkfaces(base(), base({ id: 'b', projectId: 'other' }))).toBe(false)
+    expect(canMergeWorkfaces(base(), base())).toBe(false)
+    expect(canMergeWorkfaces(base({ deletedAt: 9 }), base({ id: 'b' }))).toBe(false)
+    expect(canMergeWorkfaces(base(), base({ id: 'b', deletedAt: 9 }))).toBe(false)
+    expect(canMergeWorkfaces(undefined, base())).toBe(false)
   })
 })

@@ -5,9 +5,10 @@ import {
   cycleChainageText,
   cycleLabel,
   cyclesInPeriod,
+  filterCombinedByPeriod,
   filterCyclesByChainage,
-  summarizeCycles,
-  COMBINE_WINDOW_HOURS
+  supportMatchesRound,
+  summarizeCycles
 } from '@/core/cycles'
 import type { Process, ProcessRecord } from '@/types'
 
@@ -338,17 +339,80 @@ describe('综合视图（开挖 + 支护）', () => {
     expect(res.missingExc).toBe(1)
   })
 
-  it('支护超出配对窗口时按缺开挖处理，不硬配', () => {
+  it('不设 72 小时硬上限：隔天开始的同工作面支护仍配成完整轮', () => {
     const exc = run(excRows).filter((c) => c.family === 'exc')
     const late = run([
       rec('s9', 's-survey', '2026-10-20T08:00', '2026-10-20T09:00'),
       rec('s10', 's-shot', '2026-10-20T10:00', '2026-10-20T12:00')
     ]).filter((c) => c.family === 'sup')
-    expect(COMBINE_WINDOW_HOURS).toBe(72)
     const res = buildCombinedCycles(exc, late)
-    expect(res.rounds).toHaveLength(2)
-    expect(res.missingSup).toBe(1)
-    expect(res.missingExc).toBe(1)
+    expect(res.rounds).toHaveLength(1)
+    expect(res.rounds[0].missing).toEqual([])
+    expect(res.complete).toBe(1)
+    // 10-10 08:00 → 10-20 12:00 共 244h
+    expect(res.rounds[0].hours).toBeCloseTo(244, 3)
+  })
+
+  it('周期裁剪在配对之后：周期前开工、周期内完工仍算完整轮', () => {
+    const all = run([
+      rec('e1', 'm-survey', '2026-10-28T20:00', '2026-10-28T21:00'),
+      rec('e2', 'm-blast', '2026-10-29T03:00', '2026-10-29T04:00'),
+      rec('s1', 's-survey', '2026-10-29T08:00', '2026-10-29T09:00'),
+      rec('s2', 's-shot', '2026-10-30T05:00', '2026-10-30T06:00')
+    ])
+    const built = buildCombinedCycles(
+      all.filter((c) => c.family === 'exc'),
+      all.filter((c) => c.family === 'sup')
+    )
+    // 只看 10-30：支护在 10-30 完工，开挖 10-28 开工也要能配上
+    const res = filterCombinedByPeriod(built, '2026-10-30', '2026-10-30')
+    expect(res.rounds).toHaveLength(1)
+    expect(res.rounds[0].missing).toEqual([])
+    expect(res.rounds[0].hours).toBeCloseTo(34, 5)
+    expect(res.complete).toBe(1)
+    // 只看 10-28 时这一轮还没结束，不应出现
+    expect(filterCombinedByPeriod(built, '2026-10-28', '2026-10-28').rounds).toHaveLength(0)
+  })
+
+  it('明确属于别的桩号的支护不参与配对', () => {
+    const all = run([
+      rec('e1', 'm-survey', '2026-10-10T08:00', '2026-10-10T09:00', '', ITEM, '0+459~0+464'),
+      rec('e2', 'm-blast', '2026-10-10T16:00', '2026-10-10T18:00', '', ITEM, '0+459~0+464'),
+      rec('s1', 's-survey', '2026-10-10T20:00', '2026-10-10T21:00', '', ITEM, '0+500~0+505'),
+      rec('s2', 's-shot', '2026-10-11T01:00', '2026-10-11T02:00', '', ITEM, '0+500~0+505')
+    ])
+    const exc = all.filter((c) => c.family === 'exc')
+    const sup = all.filter((c) => c.family === 'sup')
+    expect(supportMatchesRound(sup[0], exc[0], '459-464')).toBe(false)
+    const res = buildCombinedCycles(exc, sup, '459-464')
+    expect(res.rounds).toHaveLength(1)
+    expect(res.rounds[0].missing).toEqual(['sup'])
+    expect(res.complete).toBe(0)
+    expect(res.totalHours).toBe(0)
+  })
+
+  it('多条支护轮之间不留空：支护段 = 首条开工 → 末条完工', () => {
+    const all = run([
+      rec('e1', 'm-survey', '2026-10-10T08:00', '2026-10-10T09:00'),
+      rec('e2', 'm-blast', '2026-10-10T09:00', '2026-10-10T10:00'),
+      rec('s1', 's-survey', '2026-10-10T12:00', '2026-10-10T12:30'),
+      rec('s2', 's-shot', '2026-10-10T12:30', '2026-10-10T13:00'),
+      rec('s3', 's-survey', '2026-10-10T15:00', '2026-10-10T15:30'),
+      rec('s4', 's-shot', '2026-10-10T15:30', '2026-10-10T16:00')
+    ])
+    const res = buildCombinedCycles(
+      all.filter((c) => c.family === 'exc'),
+      all.filter((c) => c.family === 'sup')
+    )
+    expect(res.rounds).toHaveLength(1)
+    const round = res.rounds[0]
+    expect(round.excHours).toBeCloseTo(2, 5)
+    expect(round.gapHours).toBeCloseTo(2, 5)
+    // 12:00 → 16:00 共 4h，中间 2h 间隔也算进支护段
+    expect(round.supHours).toBeCloseTo(4, 5)
+    expect(round.hours).toBeCloseTo(8, 5)
+    // 堆叠图三段之和必须等于综合用时
+    expect((round.excHours ?? 0) + (round.gapHours ?? 0) + (round.supHours ?? 0)).toBeCloseTo(round.hours ?? 0, 5)
   })
 
   it('按桩号筛整轮：支护没填桩号也不会被误判缺支护', () => {

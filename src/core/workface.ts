@@ -245,6 +245,18 @@ export function planWorkfaceInit(input: {
   return { create: Array.from(create.values()), revive: Array.from(revive), bind }
 }
 
+/**
+ * 能不能合并两个工作面：必须同项目、同单位工程、都未删除、不是自己合并自己。
+ * UI 已按单位工程过滤，数据层仍要拦一次，避免历史数据或同步结果里出现跨单位绑定。
+ */
+export function canMergeWorkfaces(source?: Workface, target?: Workface): boolean {
+  if (!source || !target) return false
+  if (source.id === target.id) return false
+  if (source.deletedAt || target.deletedAt) return false
+  if (source.projectId !== target.projectId) return false
+  return source.unitId === target.unitId
+}
+
 /** 桩号身份：工作面 + 规范化桩号，避免两个工作面同桩号被当成同一段 */
 export function chainageKey(workfaceId: string, normalizedChainage: string): string {
   return `${workfaceId}|${normalizedChainage}`

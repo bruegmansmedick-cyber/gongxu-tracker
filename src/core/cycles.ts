@@ -266,9 +266,6 @@ export function cycleLabel(
 
 // --------------------------------------------------------------- 综合（开挖 + 支护）
 
-/** 支护轮与开挖轮的配对窗口：超出这个跨度就不硬配 */
-export const COMBINE_WINDOW_HOURS = 72
-
 export interface CombinedCycle {
   id: string
   startAt: number
@@ -278,7 +275,7 @@ export interface CombinedCycle {
   endDate: ISODate
   /** 开挖段用时（开挖首道 → 开挖末道） */
   excHours: number | null
-  /** 支护段用时（支护首道 → 支护末道） */
+  /** 支护段用时（支护首道 → 支护末道，含轮间间隔） */
   supHours: number | null
   /** 开挖完工 → 支护开工的间隔 */
   gapHours: number | null
@@ -301,12 +298,47 @@ export interface CombinedResult {
   avgHours: number | null
 }
 
+function cyclesOverlap(a: Cycle, b: Cycle): boolean {
+  return a.chainages.some((x) => b.chainages.some((y) => chainageOverlaps(x, y)))
+}
+
 /**
- * 综合视图：把同一工作面、同一桩号范围内的开挖轮与随后的支护轮配成一轮。
- * 只在选定单一工作面 + 桩号时使用；缺环节的轮照实列出，但不产生综合用时。
+ * 支护轮能不能配到这个开挖轮：
+ *   - 支护没填桩号 → 兼容（历史数据大量缺桩号，不能因此判缺支护）；
+ *   - 支护桩号明确不属于当前选定桩号 → 不配（避免把邻近洞段的支护错配进来）；
+ *   - 开挖也没填桩号 → 没有冲突依据，兼容；
+ *   - 两边都有桩号 → 必须有交集。
+ */
+export function supportMatchesRound(sup: Cycle, exc: Cycle, chainage?: string | null): boolean {
+  if (!sup.chainages.length) return true
+  const target = String(chainage ?? '').trim()
+  if (target && !sup.chainages.some((value) => chainageOverlaps(value, target))) return false
+  if (!exc.chainages.length) return true
+  return cyclesOverlap(sup, exc)
+}
+
+function summarizeCombinedRounds(rounds: CombinedCycle[]): CombinedResult {
+  const complete = rounds.filter((r) => r.hours !== null)
+  const totalHours = complete.reduce((s, r) => s + (r.hours ?? 0), 0)
+  return {
+    rounds,
+    complete: complete.length,
+    missingExc: rounds.filter((r) => r.missing.includes('exc')).length,
+    missingSup: rounds.filter((r) => r.missing.includes('sup')).length,
+    totalHours,
+    avgHours: complete.length ? totalHours / complete.length : null
+  }
+}
+
+/**
+ * 综合视图：把同一工作面的开挖轮与随后的支护轮配成一轮。
  *
- * 注意：配对必须在**未按桩号裁剪**的两族循环上做，否则支护轮没有桩号时会被误判成"缺支护"；
- *        桩号只用来筛掉整轮（开挖或支护任一段命中即可）。
+ * 配对规则（验收口径）：
+ *   - 配对区间从本轮开挖首道开工，到**下一轮开挖首道开工**为止，不设额外时长上限；
+ *   - 同一区间内可有多条支护轮，支护段 = 首条支护开工 → 末条支护完工（含轮间间隔）；
+ *   - 支护桩号必须为空、或与开挖轮/选定桩号有交集，明确属于别的桩号的不参与配对；
+ *   - 必须在**未按日期、桩号裁剪**的完整循环上配对，裁剪放在配对之后，
+ *     否则周期前开工的开挖会被裁掉，误报"缺开挖"。
  */
 export function buildCombinedCycles(
   excCycles: Cycle[],
@@ -320,14 +352,15 @@ export function buildCombinedCycles(
 
   exc.forEach((round, i) => {
     const next = exc[i + 1]
-    const windowEnd = Math.min(next ? next.startAt : Number.POSITIVE_INFINITY, round.startAt + COMBINE_WINDOW_HOURS * HOUR)
+    const windowEnd = next ? next.startAt : Number.POSITIVE_INFINITY
     const matched = sup.filter(
-      (s) => !usedSup.has(s.id) && s.startAt >= round.startAt && s.startAt < windowEnd
+      (s) => !usedSup.has(s.id) && s.startAt >= round.startAt && s.startAt < windowEnd && supportMatchesRound(s, round, chainage)
     )
     matched.forEach((s) => usedSup.add(s.id))
     const firstSup = matched[0]
     const lastSup = matched[matched.length - 1]
-    const supHours = matched.length ? matched.reduce((sum, s) => sum + s.hours, 0) : null
+    // 支护段包含多条支护轮之间的间隔，保证「开挖段 + 间隔 + 支护段 = 综合用时」
+    const supHours = firstSup && lastSup ? Math.max(0, (lastSup.endAt - firstSup.startAt) / HOUR) : null
     const endAt = lastSup ? lastSup.endAt : round.endAt
     const endDate = lastSup ? lastSup.endDate : round.endDate
     rounds.push({
@@ -337,7 +370,7 @@ export function buildCombinedCycles(
       startDate: round.startDate,
       endDate,
       excHours: round.hours,
-      supHours,
+      supHours: supHours === null ? null : Math.round(supHours * 1000) / 1000,
       gapHours: firstSup ? Math.max(0, Math.round(((firstSup.startAt - round.endAt) / HOUR) * 1000) / 1000) : null,
       hours: matched.length ? Math.round(((endAt - round.startAt) / HOUR) * 1000) / 1000 : null,
       missing: matched.length ? [] : ['sup'],
@@ -375,14 +408,13 @@ export function buildCombinedCycles(
         [r.exc, r.sup].some((c) => c && c.chainages.some((value) => chainageOverlaps(value, target)))
       )
     : rounds
-  const complete = visible.filter((r) => r.hours !== null)
-  const totalHours = complete.reduce((s, r) => s + (r.hours ?? 0), 0)
-  return {
-    rounds: visible,
-    complete: complete.length,
-    missingExc: visible.filter((r) => r.missing.includes('exc')).length,
-    missingSup: visible.filter((r) => r.missing.includes('sup')).length,
-    totalHours,
-    avgHours: complete.length ? totalHours / complete.length : null
-  }
+  return summarizeCombinedRounds(visible)
+}
+
+/**
+ * 按综合轮的**结束日**裁剪周期。
+ * 必须在配对完成之后做：否则周期前开工、周期内完工的开挖会被提前裁掉，支护就变成"缺开挖"。
+ */
+export function filterCombinedByPeriod(result: CombinedResult, from: ISODate, to: ISODate): CombinedResult {
+  return summarizeCombinedRounds(result.rounds.filter((r) => r.endDate >= from && r.endDate <= to))
 }

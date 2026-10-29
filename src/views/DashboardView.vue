@@ -22,6 +22,7 @@ import {
   cycleChainageText,
   cycleLabel,
   cyclesInPeriod,
+  filterCombinedByPeriod,
   filterCyclesByChainage,
   summarizeCycles,
   type Cycle,
@@ -234,23 +235,25 @@ const cycleContext = computed(() => ({
 
 /** 先在"单位工程 / 工作面"的完整记录上识别，再套桩号与日期，桩号缺失不会打断轮次边界 */
 const allCycles = computed(() => buildCycles(baseRecords.value, cycleContext.value))
-const periodCyclesAll = computed(() => cyclesInPeriod(allCycles.value, range.value.from, range.value.to))
-const periodCycles = computed(() => filterCyclesByChainage(periodCyclesAll.value, state.scope.chainage))
+const periodCycles = computed(() =>
+  filterCyclesByChainage(cyclesInPeriod(allCycles.value, range.value.from, range.value.to), state.scope.chainage)
+)
 const excSummary = computed(() => summarizeCycles(periodCycles.value, 'exc'))
 const supSummary = computed(() => summarizeCycles(periodCycles.value, 'sup'))
 
 /** 综合模式只在"单一工作面 + 桩号"时启用 */
 const combinedAvailable = computed(() => state.scope.level === 'workface' && Boolean(state.scope.chainage))
-const combinedResult = computed(() =>
-  combinedAvailable.value
-    ? buildCombinedCycles(
-        // 配对用未按桩号裁剪的两族循环，避免支护轮缺桩号被误判"缺支护"；桩号只筛整轮
-        periodCyclesAll.value.filter((c) => c.family === 'exc'),
-        periodCyclesAll.value.filter((c) => c.family === 'sup'),
-        state.scope.chainage
-      )
-    : null
-)
+const combinedResult = computed(() => {
+  if (!combinedAvailable.value) return null
+  // 配对用全量循环（不按日期裁剪），再按综合轮结束日裁周期：
+  // 否则周期前开工、周期内完工的开挖会被裁掉，支护就会被误判成"缺开挖"。
+  const built = buildCombinedCycles(
+    allCycles.value.filter((c) => c.family === 'exc'),
+    allCycles.value.filter((c) => c.family === 'sup'),
+    state.scope.chainage
+  )
+  return filterCombinedByPeriod(built, range.value.from, range.value.to)
+})
 const combinedAvgText = computed(() => {
   const avg = combinedResult.value?.avgHours
   return avg === null || avg === undefined ? '—' : fmtHoursShort(avg)

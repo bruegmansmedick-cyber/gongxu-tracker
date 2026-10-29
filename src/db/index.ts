@@ -11,7 +11,7 @@ import type {
 } from '@/types'
 import { buildTimeFields } from '@/core/compute'
 import { uid } from '@/core/id'
-import { planWorkfaceInit, workfaceIdOf, workfacesOfCatalog } from '@/core/workface'
+import { canMergeWorkfaces, planWorkfaceInit, workfaceIdOf, workfacesOfCatalog } from '@/core/workface'
 import { monthKey, todayStr } from '@/core/time'
 import { BENCH_TEMPLATE, faceOfItem, refHoursOf } from '@/db/seed'
 import { buildHistoryRecords, historyRecordIds } from '@/db/history'
@@ -369,8 +369,9 @@ export async function mergeWorkfaces(sourceId: string, targetId: string): Promis
   if (sourceId === targetId) return { items: 0 }
   const now = Date.now()
   const [source, target] = await Promise.all([db.workfaces.get(sourceId), db.workfaces.get(targetId)])
-  if (!source || !target || source.deletedAt || target.deletedAt) return { items: 0 }
-  if (source.projectId !== target.projectId) return { items: 0 }
+  if (!source || !target) return { items: 0 }
+  // 同项目 + 同单位工程 + 都未删除才能合并，避免跨单位绑定
+  if (!canMergeWorkfaces(source, target)) return { items: 0 }
   let items = 0
   await db.transaction('rw', db.wbs, db.workfaces, async () => {
     const rows = await db.wbs.where('projectId').equals(source.projectId).toArray()
