@@ -14,6 +14,7 @@ import {
   RECORD_DRAFT_KEY,
   isRecordDraft,
   makeRecordDraft,
+  shouldRestoreRecordDraft,
   type RecordDraftInput
 } from '@/core/recordDraft'
 import { addDays, fmtDate, fmtHours, friendlyDate, nowHhmm, parseLooseTime, todayStr } from '@/core/time'
@@ -514,7 +515,7 @@ async function saveDraft() {
   try {
     await setKv(RECORD_DRAFT_KEY, makeRecordDraft(draftSnapshot(), savedAt))
     draftSavedAt.value = savedAt
-    showToast('已暂存本机，刷新后仍可继续填写')
+    showToast('已暂存，可在首页“今日工序记录”继续填写')
   } catch {
     showToast('暂存失败，请稍后再试')
   }
@@ -648,7 +649,8 @@ async function save() {
       operatorName: op?.name ?? '未署名'
     })
     await afterChange('records')
-    if (!recordId.value) await removeStoredDraft()
+    // 只有这一张表单本身就是草稿时才清除；从常用工序另存新记录不能误删旧草稿。
+    if (!recordId.value && draftSavedAt.value) await removeStoredDraft()
     const isToday = date.value === todayStr()
     if (recordId.value) {
       showToast('已保存修改')
@@ -711,6 +713,7 @@ async function loadFromQuery() {
   const pid = typeof q.processId === 'string' ? q.processId : ''
   const wantedItem = typeof q.itemId === 'string' ? q.itemId : ''
   const d = typeof q.date === 'string' ? q.date : ''
+  const resumeDraft = q.draft === '1'
 
   recordId.value = null
   unitId.value = ''
@@ -766,8 +769,10 @@ async function loadFromQuery() {
   startInput.value = startTime.value
   endInput.value = endTime.value
 
-  // 从首页直接新记时才恢复草稿；从常用工序等带参数进入时以这次选择为准。
-  if (!id && !pid && !wantedItem && !d) await restoreDraft()
+  // 首页加号显式恢复草稿；编辑旧记录、快捷工序或指定日期入口以本次选择为准。
+  if (shouldRestoreRecordDraft({ id, processId: pid, itemId: wantedItem, date: d, resumeDraft })) {
+    await restoreDraft()
+  }
 }
 
 watch(
@@ -790,7 +795,7 @@ onMounted(() => {
     <div v-if="draftSavedAt && !recordId" class="draft-banner">
       <div>
         <b>已暂存</b>
-        <span>{{ draftSavedLabel }} · 本机保存，正式保存后会清除</span>
+        <span>{{ draftSavedLabel }} · 返回首页可从今日记录继续，正式保存后清除</span>
       </div>
       <van-button size="mini" plain type="primary" @click="discardDraft">清除</van-button>
     </div>

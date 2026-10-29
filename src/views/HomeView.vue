@@ -1,12 +1,13 @@
 <script setup lang="ts">
-import { computed, ref } from 'vue'
+import { computed, onMounted, ref, shallowRef } from 'vue'
 import { useRouter } from 'vue-router'
 import { showToast } from 'vant'
 import { afterChange, refreshRecords, runSync, setOperator, setProject, state } from '@/store'
-import { applyBenchTemplate, saveProject, seedHistoryRecords } from '@/db'
+import { applyBenchTemplate, getKv, saveProject, seedHistoryRecords } from '@/db'
 import { BENCH_PROJECT_ID, BENCH_PROJECT_NAME, HISTORY_FACES } from '@/db/seed'
 import { HISTORY_ROWS } from '@/db/history'
 import { computeStats, recordsOfDate } from '@/core/compute'
+import { RECORD_DRAFT_KEY, isRecordDraft, type RecordDraft } from '@/core/recordDraft'
 import { shortKind, shortSpot } from '@/core/scope'
 import type { Process, ProcessRecord } from '@/types'
 import { endOfWeek, fmtHoursShort, friendlyDate, startOfWeek, todayStr } from '@/core/time'
@@ -23,12 +24,55 @@ const project = computed(() => state.projects.find((p) => p.id === state.current
 const operator = computed(() => state.operators.find((o) => o.id === state.currentOperatorId))
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
+const recordDraft = shallowRef<RecordDraft | null>(null)
 
 const todayRecords = computed(() => recordsOfDate(state.records, today))
 const todayStats = computed(() => computeStats(state.records, processById.value, today, today))
 const weekStats = computed(() =>
   computeStats(state.records, processById.value, startOfWeek(today), endOfWeek(today))
 )
+
+const draftProcess = computed(() =>
+  recordDraft.value?.processId ? processById.value.get(recordDraft.value.processId) : undefined
+)
+const draftItem = computed(() => {
+  const draft = recordDraft.value
+  if (!draft) return undefined
+  return wbsById.value.get(draftProcess.value?.itemId || draft.itemId)
+})
+const draftDivision = computed(() => {
+  const parentId = draftItem.value?.parentId
+  return parentId ? wbsById.value.get(parentId) : undefined
+})
+const draftUnit = computed(() => {
+  const parentId = draftDivision.value?.parentId
+  return parentId ? wbsById.value.get(parentId) : undefined
+})
+const draftVisible = computed(() => {
+  const draft = recordDraft.value
+  return Boolean(draft && draft.projectId === state.currentProjectId && draft.date === today)
+})
+const draftTitle = computed(() => draftProcess.value?.name || draftItem.value?.name || '未选工序')
+const draftPath = computed(() => {
+  const names = [draftUnit.value?.name, draftDivision.value?.name]
+  if (draftProcess.value || !draftItem.value) names.push(draftItem.value?.name)
+  return names.filter(Boolean).join(' / ')
+})
+const draftTimeText = computed(() => {
+  const draft = recordDraft.value
+  if (!draft) return ''
+  const start = draft.startInput || draft.startTime || '开工待填'
+  const end = draft.endInput.trim() || '完工待填'
+  return `${start} → ${end}`
+})
+const draftStatusText = computed(() => {
+  const draft = recordDraft.value
+  if (!draft) return ''
+  if (!draftItem.value) return '工程结构待选'
+  if (!draftProcess.value) return '已选分项，工序待补'
+  if (!draft.endInput.trim()) return '开工已填，待补完工'
+  return '内容待正式保存'
+})
 
 interface Group {
   itemId: string
@@ -141,15 +185,29 @@ async function onOperatorSelect(action: { value: string }) {
 }
 
 function addRecord(processId?: string) {
-  if (!state.processes.length) {
+  if (!state.processes.length && !recordDraft.value) {
     showToast('请先在“工程”页建立工序')
     return
   }
-  router.push({ path: '/record', query: { date: today, processId: processId ?? '' } })
+  const query = processId ? { date: today, processId } : { draft: '1' }
+  router.push({ path: '/record', query })
 }
 
 function editRecord(id: string) {
   router.push({ path: '/record', query: { id } })
+}
+
+function resumeDraftEntry() {
+  router.push({ path: '/record', query: { draft: '1' } })
+}
+
+async function loadDraft() {
+  try {
+    const raw = await getKv<unknown>(RECORD_DRAFT_KEY, null)
+    recordDraft.value = isRecordDraft(raw) ? raw : null
+  } catch {
+    recordDraft.value = null
+  }
 }
 
 /** 一键建立本标段项目：套用项目划分模板并补录已有循环作业记录 */
@@ -180,6 +238,7 @@ async function createBenchProject() {
 async function onRefresh() {
   refreshing.value = true
   try {
+    await loadDraft()
     if (state.sync.configured) await runSync(true)
     else {
       await refreshRecords()
@@ -189,6 +248,10 @@ async function onRefresh() {
     refreshing.value = false
   }
 }
+
+onMounted(() => {
+  void loadDraft()
+})
 </script>
 
 <template>
@@ -258,10 +321,22 @@ async function onRefresh() {
         <div class="card">
           <div class="card-title">
             今日工序记录
-            <span class="sub">{{ today }}</span>
+            <span class="sub">{{ today }}<template v-if="draftVisible"> · 1 条暂存</template></span>
           </div>
 
-          <van-empty v-if="!groups.length" description="今天还没有记录" image-size="72" />
+          <div v-if="draftVisible" class="draft-row" @click="resumeDraftEntry">
+            <div class="record-main">
+              <div class="record-name">
+                <van-tag class="draft-tag" color="#fff1cc" text-color="#9a6200">暂存</van-tag>
+                {{ draftTitle }}
+              </div>
+              <div v-if="draftPath" class="muted">{{ draftPath }}</div>
+              <div class="muted">{{ draftTimeText }} · {{ draftStatusText }}</div>
+            </div>
+            <div class="draft-continue">继续填写 <van-icon name="arrow" /></div>
+          </div>
+
+          <van-empty v-if="!groups.length && !draftVisible" description="今天还没有记录" image-size="72" />
 
           <div v-for="g in groups" :key="g.itemId" class="group">
             <div class="group-head">
@@ -369,6 +444,36 @@ async function onRefresh() {
 
 .record-row:active {
   background: #fafbfc;
+}
+
+.draft-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 4px 0 10px;
+  padding: 12px;
+  border: 1px solid #f3d590;
+  border-radius: 10px;
+  background: #fffaf0;
+}
+
+.draft-row:active {
+  background: #fff4d8;
+}
+
+.draft-tag {
+  margin-right: 6px;
+}
+
+.draft-continue {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  color: #9a6200;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 .record-main {

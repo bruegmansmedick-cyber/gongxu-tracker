@@ -1,5 +1,10 @@
 import { describe, expect, it } from 'vitest'
-import { isRecordDraft, makeRecordDraft, type RecordDraftInput } from '@/core/recordDraft'
+import {
+  isRecordDraft,
+  makeRecordDraft,
+  shouldRestoreRecordDraft,
+  type RecordDraftInput
+} from '@/core/recordDraft'
 
 const input: RecordDraftInput = {
   projectId: 'p1',
@@ -32,5 +37,15 @@ describe('工序记录暂存', () => {
     expect(isRecordDraft({ ...makeRecordDraft(input, 123), version: 2 })).toBe(false)
     expect(isRecordDraft({ ...makeRecordDraft(input, 123), note: undefined })).toBe(false)
     expect(isRecordDraft(null)).toBe(false)
+  })
+
+  it('首页加号恢复草稿，指定日期或工序入口不覆盖本次选择', () => {
+    expect(shouldRestoreRecordDraft({ resumeDraft: true })).toBe(true)
+    expect(shouldRestoreRecordDraft({})).toBe(true)
+    expect(shouldRestoreRecordDraft({ date: '2026-10-28', resumeDraft: true })).toBe(true)
+    expect(shouldRestoreRecordDraft({ date: '2026-10-28' })).toBe(false)
+    expect(shouldRestoreRecordDraft({ processId: 'pr1', resumeDraft: true })).toBe(false)
+    expect(shouldRestoreRecordDraft({ itemId: 'i1', resumeDraft: true })).toBe(false)
+    expect(shouldRestoreRecordDraft({ id: 'r1', resumeDraft: true })).toBe(false)
   })
 })

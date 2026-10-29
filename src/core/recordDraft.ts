@@ -2,6 +2,14 @@
 
 export const RECORD_DRAFT_KEY = 'ui.recordDraft'
 
+export interface RecordDraftRestoreContext {
+  id?: string
+  processId?: string
+  itemId?: string
+  date?: string
+  resumeDraft?: boolean
+}
+
 export interface RecordDraftInput {
   projectId: string
   unitId: string
@@ -22,6 +30,15 @@ export interface RecordDraftInput {
 export interface RecordDraft extends RecordDraftInput {
   version: 1
   savedAt: number
+}
+
+/**
+ * 编辑旧记录、从工序快捷入口新建、或指定日期补填时，以地址参数为准。
+ * 首页加号会显式请求恢复草稿；普通无参数入口也恢复，兼容旧链接。
+ */
+export function shouldRestoreRecordDraft(context: RecordDraftRestoreContext): boolean {
+  if (context.id || context.processId || context.itemId) return false
+  return Boolean(context.resumeDraft) || !context.date
 }
 
 export function makeRecordDraft(input: RecordDraftInput, savedAt: number): RecordDraft {
