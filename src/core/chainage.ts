@@ -1,10 +1,11 @@
 /**
  * 桩号解析与区间合并。
  *
- * 现场写法很杂：K0+413、0+413、K0+413～K0+438、0+413-0+438。
- * 统一成 `0+413~0+438`（去掉 K），并换算成米，供支护工作量与每米用时使用。
+ * 现场写法很杂：545-548、K0+413、0+413、K0+413～0+438、0+413-0+438。
+ * 完整写法统一成 `0+413~0+438`（去掉 K），短写法显示成 `413-438`，并换算成米。
  * 纯函数，无法识别时返回 null，不猜。
  */
+import type { ProcessRecord } from '@/types'
 
 export interface ChainageRange {
   /** 起始里程（米） */
@@ -13,14 +14,20 @@ export interface ChainageRange {
   endM: number
   /** 规范化后的文本，如 0+413~0+438 */
   text: string
+  /** 便于手机端图表显示的短文本，如 413-438 */
+  shortText: string
 }
 
-/** 解析单个桩号，如 K1+050.5 → 1050.5 */
+/** 解析单个桩号，如 K1+050.5、545 → 1050.5、545 */
 export function parseChainage(value: string): number | null {
   const s = String(value ?? '')
     .trim()
     .replace(/[kK]/g, '')
     .replace(/\s+/g, '')
+  if (/^\d+(?:\.\d+)?$/.test(s)) {
+    const meters = Number(s)
+    return Number.isFinite(meters) ? meters : null
+  }
   const m = /^(\d+)\+(\d+(?:\.\d+)?)$/.exec(s)
   if (!m) return null
   const km = Number(m[1])
@@ -39,6 +46,12 @@ export function formatChainage(meters: number): string {
   return `${km}+${mm}`
 }
 
+/** 米 → 手机端短桩号：413 → 413；33.7 → 33.7；1050.5 → 1+050.5 */
+export function formatChainageShort(meters: number): string {
+  if (meters < 1000) return String(Number(meters.toFixed(3)))
+  return formatChainage(meters)
+}
+
 /** 解析一段桩号；单点也接受（长度为 0），端点为负/反向时返回 null */
 export function parseChainageRange(value: string | null | undefined): ChainageRange | null {
   const s = String(value ?? '').trim()
@@ -47,13 +60,62 @@ export function parseChainageRange(value: string | null | undefined): ChainageRa
   if (parts.length === 1) {
     const one = parseChainage(parts[0])
     if (one === null) return null
-    return { startM: one, endM: one, text: formatChainage(one) }
+    return { startM: one, endM: one, text: formatChainage(one), shortText: formatChainageShort(one) }
   }
   if (parts.length !== 2) return null
   const a = parseChainage(parts[0])
   const b = parseChainage(parts[1])
   if (a === null || b === null || b < a) return null
-  return { startM: a, endM: b, text: a === b ? formatChainage(a) : `${formatChainage(a)}~${formatChainage(b)}` }
+  return {
+    startM: a,
+    endM: b,
+    text: a === b ? formatChainage(a) : `${formatChainage(a)}~${formatChainage(b)}`,
+    shortText: a === b ? formatChainageShort(a) : `${formatChainageShort(a)}-${formatChainageShort(b)}`
+  }
+}
+
+/** 新字段 chainage 优先；历史数据继续从 location 中识别，不批量改写 */
+export function recordChainage(record: Pick<ProcessRecord, 'chainage' | 'location'>): string {
+  const own = String(record.chainage ?? '').trim()
+  if (own) return own
+  const legacy = String(record.location ?? '').trim()
+  return parseChainageRange(legacy) ? legacy : ''
+}
+
+/** 任意桩号文本的简写；无法识别时原样返回，避免吞掉“左侧边坡”等历史部位 */
+export function shortChainageText(value: string | null | undefined): string {
+  const raw = String(value ?? '').trim()
+  if (!raw) return ''
+  const parsed = parseChainageRange(raw)
+  return parsed?.shortText ?? raw
+}
+
+/** 记录桩号是否与筛选桩号有交集；用于查看某一段的全部工序 */
+export function chainageOverlaps(
+  value: string | null | undefined,
+  target: string | null | undefined
+): boolean {
+  const a = parseChainageRange(value)
+  const b = parseChainageRange(target)
+  if (!a || !b) return false
+  return a.startM <= b.endM + 0.001 && a.endM + 0.001 >= b.startM
+}
+
+/** 按本次桩号终点 + 本次米数推荐下一段，如 545-548 + 3m → 548-551 */
+export function recommendNextChainage(
+  current: string | null | undefined,
+  meters: number
+): ChainageRange | null {
+  const range = parseChainageRange(current)
+  if (!range || !Number.isFinite(meters) || meters <= 0) return null
+  const start = range.endM
+  const end = start + meters
+  return {
+    startM: start,
+    endM: end,
+    text: `${formatChainage(start)}~${formatChainage(end)}`,
+    shortText: `${formatChainageShort(start)}-${formatChainageShort(end)}`
+  }
 }
 
 /** 一串桩号文本 → 合并后的区间 + 总长度（重叠/相邻不重复计） */

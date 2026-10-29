@@ -22,8 +22,16 @@ import {
   type PeriodRange
 } from '@/core/compute'
 import { buildDayRing } from '@/core/dayRing'
-import { CYCLE_FAMILIES, buildCycles, cycleChainageText, cyclesInPeriod, summarizeCycles } from '@/core/cycles'
+import {
+  CYCLE_FAMILIES,
+  buildCycles,
+  cycleChainageLabel,
+  cycleChainageText,
+  cyclesInPeriod,
+  summarizeCycles
+} from '@/core/cycles'
 import { aggregateByItem, filterByScope, shortItemLabel, stackedTrend } from '@/core/scope'
+import { mergeChainages, recordChainage, shortChainageText } from '@/core/chainage'
 import { GAP_TOLERANCE_MINUTES } from '@/core/reasons'
 import {
   addDays,
@@ -115,11 +123,14 @@ const caliberText = computed(() => {
 
 const scopeName = computed(() => {
   const s = state.scope
-  if (s.level === 'all') return '全部工程'
-  if (s.level === 'unit') return wbsById.value.get(s.unitId ?? '')?.name ?? ''
-  const item = wbsById.value.get(s.itemId ?? '')?.name ?? ''
-  const proc = s.processId ? processById.value.get(s.processId) : undefined
-  return proc ? `${item} · ${proc.name}` : item
+  let label = '全部工程'
+  if (s.level === 'unit') label = wbsById.value.get(s.unitId ?? '')?.name ?? ''
+  if (s.level === 'item') {
+    const item = wbsById.value.get(s.itemId ?? '')?.name ?? ''
+    const proc = s.processId ? processById.value.get(s.processId) : undefined
+    label = proc ? `${item} · ${proc.name}` : item
+  }
+  return s.chainage ? `${label} · 桩号 ${shortChainageText(s.chainage)}` : label
 })
 
 // ---------------------------------------------------------------- 周期趋势
@@ -137,6 +148,15 @@ const trendPeriods = computed<PeriodRange[]>(() => {
 })
 
 const trend = computed(() => buildTrend(scopeRecords.value, processById.value, trendPeriods.value))
+
+const chainagesByPeriod = computed(() =>
+  trendPeriods.value.map((period) => {
+    const values = scopeRecords.value
+      .filter((r) => r.date >= period.from && r.date <= period.to)
+      .map(recordChainage)
+    return mergeChainages(values).ranges.map(shortChainageText)
+  })
+)
 
 const trendGroupBy = computed<'item' | 'process'>(() => (state.scope.level === 'item' ? 'process' : 'item'))
 
@@ -201,7 +221,30 @@ const trendOption = computed<EChartsOption>(() => {
     tooltip: {
       trigger: 'axis',
       axisPointer: { type: 'shadow' },
-      valueFormatter: (v) => (typeof v === 'number' ? v.toFixed(2) : String(v ?? ''))
+      formatter: (params: unknown) => {
+        const list = params as Array<{
+          dataIndex: number
+          axisValueLabel?: string
+          marker: string
+          seriesName: string
+          value: number | string | null
+        }>
+        const first = list[0]
+        if (!first) return ''
+        const lines = [`<b>${first.axisValueLabel ?? ''}</b>`]
+        list.forEach((p) => {
+          const value =
+            p.seriesName === '效率' && p.value !== null
+              ? `${(Number(p.value) * 100).toFixed(1)}%`
+              : p.value === null
+                ? '—'
+                : `${typeof p.value === 'number' ? p.value.toFixed(2) : p.value}h`
+          lines.push(`${p.marker}${p.seriesName}：${value}`)
+        })
+        const chains = chainagesByPeriod.value[first.dataIndex] ?? []
+        if (chains.length) lines.push(`桩号：${chains.slice(0, 3).join(' / ')}${chains.length > 3 ? ' 等' : ''}`)
+        return lines.join('<br/>')
+      }
     },
     legend: { type: 'scroll', top: 0, itemHeight: 8, textStyle: { fontSize: 10 }, pageTextStyle: { fontSize: 10 } },
     grid: { left: 38, right: 46, top: 34, bottom: 24 },
@@ -273,10 +316,11 @@ const cycleChart = computed(() => {
     const k = `${c.startDate}-${c.family}-${c.itemId}`
     const n = (counter.get(k) ?? 0) + 1
     counter.set(k, n)
+    const chain = cycleChainageLabel(c)
     return {
       ...c,
       itemName,
-      label: `${c.startDate.slice(5)} ${shortItemLabel(itemName)}#${n}`,
+      label: chain ? `${chain}\n${cfg.label}` : `${c.startDate.slice(5)} ${shortItemLabel(itemName)}#${n}`,
       color: cfg.color
     }
   })
@@ -300,9 +344,9 @@ const cycleChartOption = computed<EChartsOption>(() => {
         const row = rows[arr[0]?.dataIndex ?? 0]
         if (!row) return ''
         const lines = [
-          `<b>${row.label}</b>`,
+          `<b>${row.label.replace('\n', ' · ')}</b>`,
           `工作面：${row.itemName}`,
-          `${fmtTs(row.startAt)} → ${fmtTs(row.boundaryEndAt)}${row.incomplete ? '（截至数据末）' : '（下一轮起点）'}`,
+          `时间：${fmtTs(row.startAt)} → ${fmtTs(row.boundaryEndAt)}${row.incomplete ? '（截至数据末）' : '（下一轮起点）'}`,
           `作业 ${row.activeHours.toFixed(1)}h · 轮内停工 ${row.idleHours.toFixed(1)}h 已剔除`,
           `${row.steps} 条记录${row.spansDays ? ' · 跨天作业' : ''}`
         ]
@@ -311,7 +355,7 @@ const cycleChartOption = computed<EChartsOption>(() => {
         return lines.join('<br/>')
       }
     },
-    grid: { left: 120, right: 54, top: 8, bottom: 22 },
+    grid: { left: 138, right: 54, top: 8, bottom: 22 },
     xAxis: {
       type: 'value',
       name: 'h',
@@ -390,7 +434,10 @@ const processRankOption = computed<EChartsOption>(() => {
           row.itemName,
           `实际 ${row.actualHours.toFixed(1)}h（${row.count} 次）`,
           base === null ? '基准：未设置' : `基准 ${base.toFixed(1)}h（${row.baselineKind === 'reference' ? '参考' : '标准'}）`,
-          `偏差 ${dev}`
+          `偏差 ${dev}`,
+          ...(row.chainages.length
+            ? [`桩号 ${row.chainages.slice(0, 3).join(' / ')}${row.chainages.length > 3 ? ' 等' : ''}`]
+            : [])
         ].join('<br/>')
       }
     },
@@ -434,9 +481,21 @@ const processRankOption = computed<EChartsOption>(() => {
 const timePieRows = computed(() => {
   if (state.scope.level === 'item' && state.scope.processId) return []
   if (state.scope.level === 'item') {
-    return procAgg.value.map((p) => ({ name: p.processName, value: Number(p.actualHours.toFixed(2)), detail: p.itemName, count: p.count }))
+    return procAgg.value.map((p) => ({
+      name: p.processName,
+      value: Number(p.actualHours.toFixed(2)),
+      detail: p.itemName,
+      count: p.count,
+      chainages: p.chainages
+    }))
   }
-  return itemAgg.value.map((i) => ({ name: i.shortName, value: Number(i.actualHours.toFixed(2)), detail: i.itemName, count: i.count }))
+  return itemAgg.value.map((i) => ({
+    name: i.shortName,
+    value: Number(i.actualHours.toFixed(2)),
+    detail: i.itemName,
+    count: i.count,
+    chainages: i.chainages
+  }))
 })
 
 const timePieTitle = computed(() =>
@@ -450,7 +509,10 @@ const timePieOption = computed<EChartsOption>(() => ({
       const item = p as { dataIndex: number; percent: number }
       const row = timePieRows.value[item.dataIndex]
       if (!row) return ''
-      return `${row.name}<br/>${row.detail}<br/>${row.value} 小时（${item.percent}%）· ${row.count} 条`
+      const chain = row.chainages.length
+        ? `<br/>桩号 ${row.chainages.slice(0, 3).join(' / ')}${row.chainages.length > 3 ? ' 等' : ''}`
+        : ''
+      return `${row.name}<br/>${row.detail}<br/>${row.value} 小时（${item.percent}%）· ${row.count} 条${chain}`
     }
   },
   legend: { bottom: 0, type: 'scroll', itemHeight: 8, textStyle: { fontSize: 10 } },
@@ -476,8 +538,8 @@ const gapRankOption = computed<EChartsOption>(() => {
   const top = [...gapTop.value].reverse()
   const labelOf = (g: (typeof top)[number]) =>
     state.scope.level === 'all'
-      ? `${shortItemLabel(g.itemName)}\n${g.prevProcessName}→${g.processName}`
-      : `${g.prevProcessName}→${g.processName}`
+      ? `${shortItemLabel(g.itemName)}\n${g.prevProcessName}→${g.processName}${g.chainage ? ` · ${g.chainage}` : ''}`
+      : `${g.prevProcessName}→${g.processName}${g.chainage ? ` · ${g.chainage}` : ''}`
   return {
     tooltip: {
       trigger: 'axis',
@@ -487,6 +549,8 @@ const gapRankOption = computed<EChartsOption>(() => {
         const item = top[arr[0]?.dataIndex ?? 0]
         if (!item) return ''
         return `${item.itemName}<br/>${item.prevProcessName} → ${item.processName}<br/>空隙 ${item.gapHours.toFixed(1)} 小时<br/>${item.date}${
+          item.chainage ? '<br/>桩号 ' + item.chainage : ''
+        }${
           item.reason ? '<br/>原因：' + item.reason : ''
         }`
       }
@@ -517,7 +581,14 @@ const gapRankOption = computed<EChartsOption>(() => {
 const reasonAgg = computed(() => aggregateByReason(gapRows.value))
 
 const reasonOption = computed<EChartsOption>(() => ({
-  tooltip: { trigger: 'item', formatter: '{b}<br/>{c} 小时（{d}%）' },
+  tooltip: {
+    trigger: 'item',
+    formatter: (p: unknown) => {
+      const row = p as { name?: string; value?: number; percent?: number }
+      const chain = state.scope.chainage ? `<br/>桩号 ${shortChainageText(state.scope.chainage)}` : ''
+      return `${row.name ?? ''}<br/>${row.value ?? 0} 小时（${row.percent ?? 0}%）${chain}`
+    }
+  },
   legend: { bottom: 0, type: 'scroll', itemHeight: 8, textStyle: { fontSize: 10 } },
   series: [
     {
@@ -789,13 +860,13 @@ onMounted(() => {
 
     <div class="card">
       <div class="card-title">
-        循环用时（开挖 / 支护）
-        <span class="sub">每轮作业用时 · 已剔除 &gt;6h 停工</span>
+        循环用时（按桩号）
+        <span class="sub">有桩号按段显示 · 已剔除 &gt;6h 停工</span>
       </div>
       <ChartBox
         v-if="cycleChart.rows.length"
         :option="cycleChartOption"
-        :height="Math.max(180, cycleChart.rows.length * 34 + 50)"
+        :height="Math.max(190, cycleChart.rows.length * 42 + 50)"
       />
       <van-empty v-else description="本期没有完整循环" image-size="60" />
       <div v-if="cycleChart.restCount" class="muted" style="margin-top: 6px; text-align: right">
@@ -806,7 +877,7 @@ onMounted(() => {
     <div v-if="periodType === 'day'" class="card">
       <div class="card-title">
         一天在干什么（24 小时圆盘）
-        <span class="sub">整圈 24h · 半圈 12h</span>
+        <span class="sub">整圈 24h · 详情含桩号</span>
       </div>
       <DayRing v-if="dayRing.stats.count" :data="dayRing" :date-label="anchor.slice(5)" @pick="openRecord" />
       <van-empty v-else description="这一天没有记录" image-size="60" />

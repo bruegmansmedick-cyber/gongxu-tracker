@@ -149,7 +149,8 @@ export async function setScope(scope: AnalysisScope): Promise<void> {
     level: scope.level,
     unitId: scope.unitId,
     itemId: scope.itemId,
-    processId: scope.processId
+    processId: scope.processId,
+    chainage: scope.chainage
   }
   state.scope = plain
   await setKv('ui.scope', { projectId: state.currentProjectId, scope: plain })

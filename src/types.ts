@@ -71,7 +71,14 @@ export interface ProcessRecord extends Syncable {
   quantity?: number
   /** 本工序开工前等待的原因标签 key */
   gapReason?: string
-  /** 部位 / 桩号，填写后衔接空隙按部位分别计算 */
+  /** 本工序开工前等待的实际起止时刻；与 gapEndTime 成对填写 */
+  gapStartTime?: HHMM
+  gapEndTime?: HHMM
+  /** 人工填写的等待时长（小时）；用于避免只靠前后工序时差推算 */
+  gapHours?: number
+  /** 桩号；新记录独立填写，缺省时兼容读取 location 中可解析的旧桩号 */
+  chainage?: string
+  /** 部位补充说明（历史数据里也可能存放桩号） */
   location?: string
   note?: string
   operatorId: string

@@ -1,11 +1,15 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import { showToast } from 'vant'
 import { setScope, state } from '@/store'
-import { ALL_SCOPE, type AnalysisScope } from '@/core/scope'
+import { ALL_SCOPE, filterByScope, type AnalysisScope } from '@/core/scope'
+import { parseChainageRange, recordChainage, shortChainageText } from '@/core/chainage'
 import type { WbsNode } from '@/types'
 
 const showScope = ref(false)
 const showProcess = ref(false)
+const showChainage = ref(false)
+const chainageDraft = ref('')
 
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
@@ -43,11 +47,14 @@ const tree = computed(() =>
 
 const currentLabel = computed(() => {
   const s = state.scope
-  if (s.level === 'all') return '全部工程'
-  if (s.level === 'unit') return wbsById.value.get(s.unitId ?? '')?.name ?? '未知单位工程'
-  const item = wbsById.value.get(s.itemId ?? '')?.name ?? '未知分项工程'
-  const proc = s.processId ? processById.value.get(s.processId) : undefined
-  return proc ? `${item} · ${proc.name}` : item
+  let label = '全部工程'
+  if (s.level === 'unit') label = wbsById.value.get(s.unitId ?? '')?.name ?? '未知单位工程'
+  if (s.level === 'item') {
+    const item = wbsById.value.get(s.itemId ?? '')?.name ?? '未知分项工程'
+    const proc = s.processId ? processById.value.get(s.processId) : undefined
+    label = proc ? `${item} · ${proc.name}` : item
+  }
+  return s.chainage ? `${label} · ${shortChainageText(s.chainage)}` : label
 })
 
 const currentProcessLabel = computed(() => {
@@ -62,6 +69,24 @@ const itemProcesses = computed(() =>
     : []
 )
 
+const currentChainageLabel = computed(() =>
+  state.scope.chainage ? shortChainageText(state.scope.chainage) : '全部桩号'
+)
+
+/** 当前结构范围内出现过的桩号，按里程排序，方便直接点选 */
+const chainageOptions = computed(() => {
+  const baseScope = { ...state.scope, chainage: undefined }
+  const rows = filterByScope(state.records, baseScope, processById.value, wbsById.value)
+  const map = new Map<string, { text: string; short: string; startM: number }>()
+  rows.forEach((r) => {
+    const text = recordChainage(r)
+    const parsed = parseChainageRange(text)
+    if (!parsed) return
+    map.set(parsed.shortText, { text, short: parsed.shortText, startM: parsed.startM })
+  })
+  return Array.from(map.values()).sort((a, b) => a.startM - b.startM)
+})
+
 async function pick(scope: AnalysisScope) {
   await setScope(scope)
   showScope.value = false
@@ -70,6 +95,27 @@ async function pick(scope: AnalysisScope) {
 async function pickProcess(processId: string) {
   await setScope({ ...state.scope, processId: processId || undefined })
   showProcess.value = false
+}
+
+function openChainage() {
+  chainageDraft.value = state.scope.chainage ? shortChainageText(state.scope.chainage) : ''
+  showChainage.value = true
+}
+
+async function applyChainage(value = chainageDraft.value) {
+  const text = value.trim()
+  if (!text) {
+    await setScope({ ...state.scope, chainage: undefined })
+    showChainage.value = false
+    return
+  }
+  const parsed = parseChainageRange(text)
+  if (!parsed) {
+    showToast('桩号格式示例：545-548')
+    return
+  }
+  await setScope({ ...state.scope, chainage: parsed.shortText })
+  showChainage.value = false
 }
 
 function isUnitActive(unitId: string) {
@@ -97,6 +143,14 @@ function isItemActive(itemId: string) {
         <div class="scope-value">{{ currentProcessLabel }}</div>
       </div>
       <span class="scope-switch">切换 <van-icon name="arrow" /></span>
+    </div>
+    <div class="divider" />
+    <div class="scope-row" @click="openChainage">
+      <div class="scope-main">
+        <div class="muted">桩号</div>
+        <div class="scope-value">{{ currentChainageLabel }}</div>
+      </div>
+      <span class="scope-switch">筛选 <van-icon name="arrow" /></span>
     </div>
   </div>
 
@@ -149,6 +203,36 @@ function isItemActive(itemId: string) {
       </div>
     </div>
   </van-popup>
+
+  <van-popup v-model:show="showChainage" round position="bottom" :style="{ maxHeight: '70vh' }">
+    <div class="picker">
+      <div class="picker-title">按桩号筛选</div>
+      <van-field
+        v-model="chainageDraft"
+        label="桩号"
+        placeholder="如 545-548、545~548"
+        @keyup.enter="applyChainage()"
+      />
+      <div class="muted chainage-tip">连接符支持 -、~、～ 或“至”；点已有桩号可直接筛选。</div>
+      <div class="picker-actions">
+        <van-button size="small" block @click="applyChainage('')">全部桩号</van-button>
+        <van-button size="small" block type="primary" @click="applyChainage()">应用</van-button>
+      </div>
+      <div class="picker-body">
+        <div
+          v-for="row in chainageOptions"
+          :key="row.short"
+          class="picker-item"
+          :class="{ active: currentChainageLabel === row.short }"
+          @click="applyChainage(row.text)"
+        >
+          <span>{{ row.short }}</span>
+          <van-icon v-if="currentChainageLabel === row.short" name="success" />
+        </div>
+        <van-empty v-if="!chainageOptions.length" description="当前范围内还没有可识别桩号" image-size="54" />
+      </div>
+    </div>
+  </van-popup>
 </template>
 
 <style scoped>
@@ -194,6 +278,18 @@ function isItemActive(itemId: string) {
 .picker-body {
   max-height: 62vh;
   overflow-y: auto;
+}
+
+.chainage-tip {
+  padding: 8px 16px;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.picker-actions {
+  display: flex;
+  gap: 10px;
+  padding: 0 16px 8px;
 }
 
 .picker-item {

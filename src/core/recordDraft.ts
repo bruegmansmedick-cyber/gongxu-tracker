@@ -23,6 +23,9 @@ export interface RecordDraftInput {
   endInput: string
   quantity: string
   gapReason: string
+  gapStartTime?: string
+  gapEndTime?: string
+  chainage?: string
   location: string
   note: string
 }
@@ -57,6 +60,9 @@ export function makeRecordDraft(input: RecordDraftInput, savedAt: number): Recor
     endInput: input.endInput,
     quantity: input.quantity,
     gapReason: input.gapReason,
+    gapStartTime: input.gapStartTime ?? '',
+    gapEndTime: input.gapEndTime ?? '',
+    chainage: input.chainage ?? '',
     location: input.location,
     note: input.note
   }
@@ -82,5 +88,9 @@ export function isRecordDraft(value: unknown): value is RecordDraft {
     'location',
     'note'
   ] as const
-  return stringFields.every((key) => typeof row[key] === 'string')
+  const optionalStrings = ['gapStartTime', 'gapEndTime', 'chainage'] as const
+  return (
+    stringFields.every((key) => typeof row[key] === 'string') &&
+    optionalStrings.every((key) => row[key] === undefined || typeof row[key] === 'string')
+  )
 }

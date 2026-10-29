@@ -520,6 +520,10 @@ export interface RecordInput {
   endTime: string
   quantity?: number
   gapReason?: string
+  gapStartTime?: string
+  gapEndTime?: string
+  gapHours?: number
+  chainage?: string
   location?: string
   note?: string
   operatorId: string
@@ -541,6 +545,10 @@ export async function saveRecord(input: RecordInput): Promise<ProcessRecord> {
     ...times,
     quantity: input.quantity,
     gapReason: input.gapReason,
+    gapStartTime: input.gapStartTime,
+    gapEndTime: input.gapEndTime,
+    gapHours: input.gapHours,
+    chainage: input.chainage,
     location: input.location,
     note: input.note,
     operatorId: input.operatorId,
@@ -568,7 +576,20 @@ export async function saveRecord(input: RecordInput): Promise<ProcessRecord> {
       ? diffOf(
           existing as unknown as Record<string, unknown>,
           row as unknown as Record<string, unknown>,
-          ['date', 'startTime', 'endTime', 'quantity', 'gapReason', 'location', 'note', 'operatorName']
+          [
+            'date',
+            'startTime',
+            'endTime',
+            'quantity',
+            'gapReason',
+            'gapStartTime',
+            'gapEndTime',
+            'gapHours',
+            'chainage',
+            'location',
+            'note',
+            'operatorName'
+          ]
         )
       : undefined
   })

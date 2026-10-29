@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest'
-import { buildCycles, cycleChainageText, cyclesInPeriod, summarizeCycles, CYCLE_IDLE_GAP_HOURS } from '@/core/cycles'
+import {
+  buildCycles,
+  cycleChainageLabel,
+  cycleChainageText,
+  cyclesInPeriod,
+  summarizeCycles,
+  CYCLE_IDLE_GAP_HOURS
+} from '@/core/cycles'
 import type { Process, ProcessRecord } from '@/types'
 
 const T = (s: string) => new Date(`${s}+08:00`).getTime()
@@ -161,7 +168,18 @@ describe('循环识别', () => {
     expect(cycles[0].chainageLengthM).toBeCloseTo(5, 3)
     // 08-09 + 10-12 之间 1h 属短衔接，合并成 08-12 共 4h，5m → 0.8h/m
     expect(cycles[0].hoursPerMeter).toBeCloseTo(0.8, 3)
-    expect(cycleChainageText(cycles[0])).toBe('桩号 0+459~0+464（5.0m）· 0.80h/m')
+    expect(cycles[0].chainages).toEqual(['0+459~0+464'])
+    expect(cycleChainageLabel(cycles[0])).toBe('459-464')
+    expect(cycleChainageText(cycles[0])).toBe('桩号 459-464（5.0m）· 0.80h/m')
+  })
+
+  it('新 chainage 字段优先于旧 location', () => {
+    const cycles = run([
+      { ...rec('s1', 's-survey', '2026-10-10T08:00', '2026-10-10T09:00', '', ITEM, '0+100~0+103'), chainage: '545-548' },
+      { ...rec('s2', 's-shot', '2026-10-10T10:00', '2026-10-10T12:00', '', ITEM, '0+100~0+103'), chainage: '545-548' }
+    ])
+    expect(cycles[0].chainages).toEqual(['0+545~0+548'])
+    expect(cycleChainageLabel(cycles[0])).toBe('545-548')
   })
 
   it('没有桩号时长度和每米用时为空', () => {

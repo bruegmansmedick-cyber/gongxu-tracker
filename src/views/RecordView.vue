@@ -4,9 +4,10 @@ import { useRoute, useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { afterChange, state } from '@/store'
 import { deleteRecord as removeRecord, delKv, getKv, getRecord, saveProcess, saveRecord, setKv } from '@/db'
-import { buildTimeFields, suggestStandardHours } from '@/core/compute'
+import { buildTimeFields, manualGapHoursOf, suggestStandardHours } from '@/core/compute'
 import { checkBeforeSave } from '@/core/health'
-import { parseChainageRange } from '@/core/chainage'
+import { parseChainageRange, recommendNextChainage } from '@/core/chainage'
+import { familyOfKey, processKeyOf } from '@/core/cycles'
 import { GAP_REASONS, MAX_CUSTOM_REASONS, mergeCustomReasons } from '@/core/reasons'
 import { recommendProcesses, rememberProcess, type ProcessMemory } from '@/core/recommend'
 import { buildUsageIndex, predictSelection, rankByUsage } from '@/core/predict'
@@ -40,12 +41,26 @@ const endInput = ref(endTime.value)
 const timeInvalid = reactive({ start: false, end: false })
 const quantity = ref<string>('')
 const gapReason = ref('none')
+const gapStartTime = ref('')
+const gapEndTime = ref('')
+const gapStartInput = ref('')
+const gapEndInput = ref('')
+const gapTimeInvalid = reactive({ start: false, end: false })
+const chainage = ref('')
+const chainageError = ref('')
 const location = ref('')
 const locationError = ref('')
 const note = ref('')
 const saving = ref(false)
 /** 当前本机草稿的暂存时间；0 表示本次表单没有恢复/保存草稿 */
 const draftSavedAt = ref(0)
+const NEXT_CHAINAGE_KEY = 'ui.nextChainage'
+
+interface NextChainageMemory {
+  itemId: string
+  value: string
+  savedAt: number
+}
 
 const showCalendar = ref(false)
 const showReasonPicker = ref(false)
@@ -103,13 +118,23 @@ const unit = computed(() => wbsById.value.get(unitId.value))
 const division = computed(() => wbsById.value.get(divisionId.value))
 const item = computed(() => wbsById.value.get(itemId.value))
 const selectedProcess = computed(() => processById.value.get(processId.value))
-/** 支护类工序（s-*）：桩号建议填写，用于看板按桩号看工作量 */
-const isSupport = computed(() => {
-  const key = selectedProcess.value?.id.split('--').pop() ?? ''
-  return key.startsWith('s-')
-})
+/** 桩号失焦时规范化成手机端短写法；连接符统一显示为 `-` */
+function normalizeChainage() {
+  const text = chainage.value.trim()
+  if (!text) {
+    chainageError.value = recordId.value ? '' : '请填写桩号'
+    return
+  }
+  const parsed = parseChainageRange(text)
+  if (parsed) {
+    chainage.value = parsed.shortText
+    chainageError.value = ''
+    return
+  }
+  chainageError.value = '格式示例：545-548、545~548、0+545~0+548'
+}
 
-/** 支护/桩号失焦时规范化；开挖的自由文本保持原样 */
+/** 历史数据在 location 中带桩号时，编辑这条记录会自动搬到新字段 */
 function normalizeLocation() {
   const text = location.value.trim()
   if (!text) {
@@ -117,16 +142,14 @@ function normalizeLocation() {
     return
   }
   const parsed = parseChainageRange(text)
-  if (parsed) {
-    location.value = parsed.text
+  if (parsed && !chainage.value.trim()) {
+    chainage.value = parsed.shortText
+    chainageError.value = ''
+    location.value = ''
     locationError.value = ''
     return
   }
-  if (isSupport.value || text.includes('+')) {
-    locationError.value = '格式示例：0+413~0+438'
-  } else {
-    locationError.value = ''
-  }
+  locationError.value = ''
 }
 
 /** 该分项下已有的工序（工程管理里建的、别的设备同步过来的都算） */
@@ -179,6 +202,40 @@ const crossMidnight = computed(() => {
   const [eh, em] = endTime.value.split(':').map(Number)
   return eh * 60 + em <= sh * 60 + sm
 })
+
+const manualGapHours = computed(() => {
+  if (!gapStartTime.value || !gapEndTime.value) return null
+  return manualGapHoursOf({ gapStartTime: gapStartTime.value, gapEndTime: gapEndTime.value })
+})
+
+const cycleFamily = computed(() => familyOfKey(processKeyOf(selectedProcess.value?.id ?? '')))
+
+/** 当前分项同一循环族里排序最后的一道工序 */
+const isLastCycleProcess = computed(() => {
+  if (!cycleFamily.value || !itemId.value || !processId.value) return false
+  const peers = state.processes
+    .filter(
+      (p) =>
+        p.itemId === itemId.value &&
+        p.enabled &&
+        familyOfKey(processKeyOf(p.id)) === cycleFamily.value
+    )
+    .sort((a, b) => a.sort - b.sort)
+  return peers[peers.length - 1]?.id === processId.value
+})
+
+const recommendationMeters = computed(() => {
+  const qty = Number(quantity.value)
+  if (Number.isFinite(qty) && qty > 0) return qty
+  const parsed = parseChainageRange(chainage.value)
+  return parsed ? parsed.endM - parsed.startM : 0
+})
+
+const nextChainageRecommendation = computed(() =>
+  !recordId.value && isLastCycleProcess.value
+    ? recommendNextChainage(chainage.value, recommendationMeters.value)
+    : null
+)
 
 /** 等待原因显示：内置的查表，自己加的显示原文 */
 const reasonText = computed(() => {
@@ -235,6 +292,7 @@ function applyPrediction(from: 'unit' | 'division') {
   if (res.itemId) {
     itemId.value = res.itemId
     predicted.item = true
+    void prefillNextChainage(res.itemId)
   }
   if (res.processId) processId.value = res.processId
 
@@ -249,6 +307,12 @@ function chooseNode(id: string) {
   const level = pickerLevel.value
   pickerLevel.value = ''
   search.value = ''
+  if (!recordId.value) {
+    chainage.value = ''
+    chainageError.value = ''
+    location.value = ''
+    locationError.value = ''
+  }
   if (level === 'unit') {
     unitId.value = id
     divisionId.value = ''
@@ -273,6 +337,7 @@ function chooseNode(id: string) {
     // 这个分项一道工序都没有时，直接把工序表推出来，省得录不进去还不知道为什么
     const siblings = state.processes.filter((p) => p.itemId === id && p.enabled)
     if (!siblings.length) showProcessSheet.value = true
+    void prefillNextChainage(id)
   }
 }
 
@@ -280,6 +345,16 @@ function pickProcess(p: Process) {
   processId.value = p.id
   predictedHint.value = ''
   showProcessSheet.value = false
+}
+
+/** 上一条循环末工序保存后预留的下一段桩号，只在本机用于下一次新建 */
+async function prefillNextChainage(targetItemId = itemId.value) {
+  if (!targetItemId || recordId.value || chainage.value.trim() || draftSavedAt.value) return
+  const saved = await getKv<NextChainageMemory | null>(NEXT_CHAINAGE_KEY, null)
+  if (saved?.itemId === targetItemId && saved.value) {
+    chainage.value = saved.value
+    chainageError.value = ''
+  }
 }
 
 async function rememberThisItem(name: string) {
@@ -396,30 +471,46 @@ function setQuickDate(value: string) {
   date.value = value
 }
 
+type TimeKind = 'start' | 'end' | 'gapStart' | 'gapEnd'
+
+function timeInputOf(kind: TimeKind) {
+  if (kind === 'start') return startInput
+  if (kind === 'end') return endInput
+  if (kind === 'gapStart') return gapStartInput
+  return gapEndInput
+}
+
+function timeValueOf(kind: TimeKind) {
+  if (kind === 'start') return startTime
+  if (kind === 'end') return endTime
+  if (kind === 'gapStart') return gapStartTime
+  return gapEndTime
+}
+
+function markTimeInvalid(kind: TimeKind, invalid: boolean) {
+  if (kind === 'gapStart') gapTimeInvalid.start = invalid
+  else if (kind === 'gapEnd') gapTimeInvalid.end = invalid
+  else timeInvalid[kind] = invalid
+}
+
 /** 输入框只留数字和冒号，其它字符直接挡掉 */
-function onTimeInput(kind: 'start' | 'end', raw: string) {
+function onTimeInput(kind: TimeKind, raw: string) {
   const cleaned = String(raw ?? '').replace(/[^\d:]/g, '').slice(0, 5)
-  timeInvalid[kind] = false
-  if (kind === 'start') startInput.value = cleaned
-  else endInput.value = cleaned
+  markTimeInvalid(kind, false)
+  timeInputOf(kind).value = cleaned
 }
 
 /** 失焦或保存时校验并规范成 HH:mm；不合法就保留原文并标红，等用户改 */
-function commitTime(kind: 'start' | 'end'): boolean {
-  const raw = kind === 'start' ? startInput.value : endInput.value
+function commitTime(kind: TimeKind): boolean {
+  const raw = timeInputOf(kind).value
   const parsed = parseLooseTime(raw)
   if (!parsed) {
-    timeInvalid[kind] = true
+    markTimeInvalid(kind, true)
     return false
   }
-  timeInvalid[kind] = false
-  if (kind === 'start') {
-    startTime.value = parsed
-    startInput.value = parsed
-  } else {
-    endTime.value = parsed
-    endInput.value = parsed
-  }
+  markTimeInvalid(kind, false)
+  timeValueOf(kind).value = parsed
+  timeInputOf(kind).value = parsed
   return true
 }
 
@@ -429,15 +520,28 @@ function commitTimes(): boolean {
   return okStart && okEnd
 }
 
-function setTime(kind: 'start' | 'end', value: string) {
-  timeInvalid[kind] = false
-  if (kind === 'start') {
-    startTime.value = value
-    startInput.value = value
-  } else {
-    endTime.value = value
-    endInput.value = value
+function commitGapTimes(): boolean {
+  const hasStart = Boolean(gapStartInput.value.trim())
+  const hasEnd = Boolean(gapEndInput.value.trim())
+  if (!hasStart && !hasEnd) {
+    gapStartTime.value = ''
+    gapEndTime.value = ''
+    gapTimeInvalid.start = false
+    gapTimeInvalid.end = false
+    return true
   }
+  if (!hasStart || !hasEnd) {
+    gapTimeInvalid.start = !hasStart
+    gapTimeInvalid.end = !hasEnd
+    return false
+  }
+  return commitTime('gapStart') && commitTime('gapEnd')
+}
+
+function setTime(kind: TimeKind, value: string) {
+  markTimeInvalid(kind, false)
+  timeValueOf(kind).value = value
+  timeInputOf(kind).value = value
 }
 
 function fillNowStart() {
@@ -499,6 +603,9 @@ function draftSnapshot(): RecordDraftInput {
     endInput: endInput.value,
     quantity: quantity.value,
     gapReason: gapReason.value,
+    gapStartTime: gapStartTime.value,
+    gapEndTime: gapEndTime.value,
+    chainage: chainage.value,
     location: location.value,
     note: note.value
   }
@@ -566,6 +673,14 @@ async function restoreDraft() {
   timeInvalid.end = false
   quantity.value = raw.quantity
   gapReason.value = raw.gapReason || 'none'
+  gapStartTime.value = raw.gapStartTime ?? ''
+  gapEndTime.value = raw.gapEndTime ?? ''
+  gapStartInput.value = raw.gapStartTime ?? ''
+  gapEndInput.value = raw.gapEndTime ?? ''
+  gapTimeInvalid.start = false
+  gapTimeInvalid.end = false
+  chainage.value = raw.chainage ?? ''
+  chainageError.value = ''
   location.value = raw.location
   locationError.value = ''
   note.value = raw.note
@@ -592,26 +707,19 @@ async function save() {
     showToast('请先改正时间格式，如 08:30')
     return
   }
-  // 支护桩号不强制，但没填/写错时提醒一次，允许先存后补
-  if (isSupport.value) {
-    const parsed = parseChainageRange(location.value)
-    if (parsed) {
-      location.value = parsed.text
-      locationError.value = ''
-    } else {
-      locationError.value = '格式示例：0+413~0+438'
-      try {
-        await showConfirmDialog({
-          title: '支护桩号未填',
-          message: '这条支护记录还没有有效桩号，建议补上后再保存，方便看板按桩号看工作量。也可以先保存，之后在明细里补填。',
-          confirmButtonText: '仍然保存',
-          cancelButtonText: '去填写'
-        })
-      } catch {
-        return
-      }
-    }
+  if (!commitGapTimes()) {
+    showToast('等待开始和结束要同时填写，或都留空')
+    return
   }
+  // 新建记录必须填有效桩号；编辑历史无桩号记录时仍可保存，避免强行打断旧数据修订。
+  const requiresChainage = !recordId.value || Boolean(chainage.value.trim())
+  const chainageRange = parseChainageRange(chainage.value)
+  if (requiresChainage && !chainageRange) {
+    chainageError.value = '请填写有效桩号，格式示例：545-548'
+    showToast(chainage.value.trim() ? '请改正桩号格式' : '请填写桩号')
+    return
+  }
+  if (chainageRange) chainage.value = chainageRange.shortText
   saving.value = true
   try {
     const op = state.operators.find((o) => o.id === state.currentOperatorId)
@@ -634,7 +742,7 @@ async function save() {
         return
       }
     }
-    await saveRecord({
+    const saved = await saveRecord({
       id: recordId.value ?? undefined,
       projectId: state.currentProjectId,
       processId: processId.value,
@@ -643,11 +751,23 @@ async function save() {
       endTime: endTime.value,
       quantity: quantity.value === '' ? undefined : Number(quantity.value),
       gapReason: gapReason.value,
+      gapStartTime: gapStartTime.value || undefined,
+      gapEndTime: gapEndTime.value || undefined,
+      gapHours: manualGapHours.value ?? undefined,
+      chainage: chainage.value.trim() || undefined,
       location: location.value.trim() || undefined,
       note: note.value.trim() || undefined,
       operatorId: state.currentOperatorId,
       operatorName: op?.name ?? '未署名'
     })
+    const next = nextChainageRecommendation.value
+    if (next && !recordId.value) {
+      await setKv(NEXT_CHAINAGE_KEY, {
+        itemId: saved.processId ? (processById.value.get(saved.processId)?.itemId ?? itemId.value) : itemId.value,
+        value: next.shortText,
+        savedAt: Date.now()
+      })
+    }
     await afterChange('records')
     // 只有这一张表单本身就是草稿时才清除；从常用工序另存新记录不能误删旧草稿。
     if (!recordId.value && draftSavedAt.value) await removeStoredDraft()
@@ -733,6 +853,14 @@ async function loadFromQuery() {
   timeInvalid.end = false
   quantity.value = ''
   gapReason.value = 'none'
+  gapStartTime.value = ''
+  gapEndTime.value = ''
+  gapStartInput.value = ''
+  gapEndInput.value = ''
+  gapTimeInvalid.start = false
+  gapTimeInvalid.end = false
+  chainage.value = ''
+  chainageError.value = ''
   location.value = ''
   locationError.value = ''
   note.value = ''
@@ -762,7 +890,13 @@ async function loadFromQuery() {
       endInput.value = row.endTime
       quantity.value = row.quantity === undefined ? '' : String(row.quantity)
       gapReason.value = row.gapReason ?? 'none'
-      location.value = row.location ?? ''
+      gapStartTime.value = row.gapStartTime ?? ''
+      gapEndTime.value = row.gapEndTime ?? ''
+      gapStartInput.value = row.gapStartTime ?? ''
+      gapEndInput.value = row.gapEndTime ?? ''
+      const legacyChainage = parseChainageRange(row.location)
+      chainage.value = parseChainageRange(row.chainage)?.shortText ?? legacyChainage?.shortText ?? ''
+      location.value = legacyChainage && !row.chainage ? '' : (row.location ?? '')
       note.value = row.note ?? ''
     }
   }
@@ -772,6 +906,9 @@ async function loadFromQuery() {
   // 首页加号显式恢复草稿；编辑旧记录、快捷工序或指定日期入口以本次选择为准。
   if (shouldRestoreRecordDraft({ id, processId: pid, itemId: wantedItem, date: d, resumeDraft })) {
     await restoreDraft()
+    if (!chainage.value.trim()) await prefillNextChainage()
+  } else if (!id) {
+    await prefillNextChainage()
   }
 }
 
@@ -838,6 +975,15 @@ onMounted(() => {
         </template>
       </van-field>
       <van-field
+        v-model="chainage"
+        label="桩号"
+        placeholder="如 545-548；也支持 545~548"
+        required
+        :error-message="chainageError"
+        @blur="normalizeChainage"
+      />
+      <div class="item-note">连接符可用 ~、-、～ 或“至”；保存后统一显示为简写，如 545-548。</div>
+      <van-field
         :model-value="selectedProcess?.name ?? ''"
         label="工序"
         :placeholder="itemId ? '选择工序，或新增一道' : '请先选分项工程'"
@@ -849,6 +995,10 @@ onMounted(() => {
       />
       <div v-if="predictedHint" class="item-note predicted">{{ predictedHint }}，可点开上面任意一栏修改</div>
       <div v-if="item?.note" class="item-note">{{ item.note }}</div>
+      <div v-if="nextChainageRecommendation" class="chainage-recommend">
+        <span>下一段建议 <b>{{ nextChainageRecommendation.shortText }}</b></span>
+        <span>{{ recommendationMeters.toFixed(1) }}m 累加 · 保存后下次自动带入</span>
+      </div>
     </van-cell-group>
 
     <van-cell-group inset style="margin-top: 12px">
@@ -870,45 +1020,47 @@ onMounted(() => {
           </div>
         </template>
       </van-field>
-      <van-field
-        :model-value="startInput"
-        label="开工时刻"
-        type="text"
-        inputmode="numeric"
-        maxlength="5"
-        placeholder="如 08:30，或只输 830"
-        :error-message="timeInvalid.start ? '格式不对，请按 08:30 填' : ''"
-        required
-        @update:model-value="onTimeInput('start', $event)"
-        @blur="commitTime('start')"
-      >
-        <template #button>
-          <van-button size="mini" plain type="primary" @click.stop="fillNowStart">现在</van-button>
-        </template>
-      </van-field>
-      <van-field
-        :model-value="endInput"
-        label="完工时刻"
-        type="text"
-        inputmode="numeric"
-        maxlength="5"
-        placeholder="如 12:00，或只输 1200"
-        :error-message="timeInvalid.end ? '格式不对，请按 12:00 填' : ''"
-        required
-        @update:model-value="onTimeInput('end', $event)"
-        @blur="commitTime('end')"
-      >
-        <template #button>
-          <van-button size="mini" plain type="primary" @click.stop="fillNowEnd">现在</van-button>
-        </template>
-      </van-field>
+      <div class="time-pair">
+        <van-field
+          :model-value="startInput"
+          label="开工"
+          type="text"
+          inputmode="numeric"
+          maxlength="5"
+          placeholder="08:30"
+          :error-message="timeInvalid.start ? '格式不对' : ''"
+          required
+          @update:model-value="onTimeInput('start', $event)"
+          @blur="commitTime('start')"
+        >
+          <template #button>
+            <van-button class="now-button" size="mini" plain type="primary" @click.stop="fillNowStart">现在</van-button>
+          </template>
+        </van-field>
+        <van-field
+          :model-value="endInput"
+          label="完工"
+          type="text"
+          inputmode="numeric"
+          maxlength="5"
+          placeholder="12:00"
+          :error-message="timeInvalid.end ? '格式不对' : ''"
+          required
+          @update:model-value="onTimeInput('end', $event)"
+          @blur="commitTime('end')"
+        >
+          <template #button>
+            <van-button class="now-button" size="mini" plain type="primary" @click.stop="fillNowEnd">现在</van-button>
+          </template>
+        </van-field>
+      </div>
       <van-field label="净用时">
         <template #input>
           <span class="num" style="font-size: 17px; font-weight: 600; color: #1f6feb">{{ fmtHours(hours) }}</span>
           <span v-if="crossMidnight" class="tag-soft" style="margin-left: 8px">跨零点</span>
         </template>
       </van-field>
-      <div class="time-hint muted">直接输入时间，如 08:30；也可只输 830。完工早于开工会自动按跨零点算。</div>
+      <div class="time-hint muted">左右两格可直接输入 08:30 或 830；完工早于开工自动按跨零点算。</div>
     </van-cell-group>
 
     <van-cell-group inset style="margin-top: 12px">
@@ -930,10 +1082,38 @@ onMounted(() => {
         placeholder="选择本条记录开工前的等待原因"
         @click="showReasonPicker = true"
       />
+      <div class="time-pair">
+        <van-field
+          :model-value="gapStartInput"
+          label="等待起"
+          type="text"
+          inputmode="numeric"
+          maxlength="5"
+          placeholder="05:30"
+          :error-message="gapTimeInvalid.start ? '格式不对' : ''"
+          @update:model-value="onTimeInput('gapStart', $event)"
+          @blur="commitTime('gapStart')"
+        />
+        <van-field
+          :model-value="gapEndInput"
+          label="等待止"
+          type="text"
+          inputmode="numeric"
+          maxlength="5"
+          placeholder="07:35"
+          :error-message="gapTimeInvalid.end ? '格式不对' : ''"
+          @update:model-value="onTimeInput('gapEnd', $event)"
+          @blur="commitTime('gapEnd')"
+        />
+      </div>
+      <div class="time-hint muted">
+        等待起止可不填；填了会直接作为本条开工前的等待时长
+        <template v-if="manualGapHours !== null">（当前 {{ fmtHours(manualGapHours) }}）</template>，不再靠前后工序时差推算。
+      </div>
       <van-field
         v-model="location"
-        :label="isSupport ? '支护桩号' : '部位/桩号'"
-        :placeholder="isSupport ? '如 0+413~0+438（可后补，建议填写）' : '如：0+120 左侧边坡（选填）'"
+        label="部位补充"
+        placeholder="如：左侧边坡（选填）"
         :error-message="locationError"
         @blur="normalizeLocation"
       />
@@ -1162,6 +1342,66 @@ onMounted(() => {
 
 .item-note.predicted {
   color: #1f6feb;
+}
+
+.chainage-recommend {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 0 16px 10px;
+  padding: 9px 11px;
+  border: 1px solid #cfe0ff;
+  border-radius: 10px;
+  background: #f3f7ff;
+  color: #24539b;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.chainage-recommend b {
+  font-size: 14px;
+}
+
+.chainage-recommend span:last-child {
+  flex-shrink: 0;
+  color: #62789a;
+}
+
+.time-pair {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.time-pair :deep(.van-field) {
+  min-width: 0;
+  padding-left: 12px;
+  padding-right: 8px;
+}
+
+.time-pair :deep(.van-field:first-child) {
+  border-right: 1px solid #f0f2f5;
+}
+
+.time-pair :deep(.van-field__label) {
+  width: 4.2em;
+  margin-right: 6px;
+  font-size: 13px;
+}
+
+.time-pair :deep(.van-field__control) {
+  min-width: 0;
+  font-size: 13px;
+}
+
+.time-pair :deep(.van-field__button) {
+  margin-left: 2px;
+}
+
+.now-button {
+  padding-left: 6px;
+  padding-right: 6px;
+  font-size: 11px;
 }
 
 .time-hint {

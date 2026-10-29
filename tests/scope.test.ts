@@ -100,11 +100,31 @@ describe('按范围过滤', () => {
     expect(rows.map((r) => r.id)).toEqual(['r2'])
   })
 
+  it('按桩号交集过滤，同时保留分项和工序条件', () => {
+    const chainageRows = records.map((r) => ({
+      ...r,
+      chainage: r.id === 'r1' ? '545-548' : r.id === 'r2' ? '548-551' : '600-603'
+    }))
+    expect(
+      filterByScope(chainageRows, { level: 'item', itemId: 'i1', chainage: '547-550' }, processById, wbsById).map(
+        (r) => r.id
+      )
+    ).toEqual(['r1', 'r2'])
+    expect(
+      filterByScope(chainageRows, { level: 'item', itemId: 'i1', processId: 'pb', chainage: '547-550' }, processById, wbsById).map(
+        (r) => r.id
+      )
+    ).toEqual(['r2'])
+  })
+
   it('范围名可读', () => {
     expect(scopeLabel({ level: 'all' }, wbsById)).toBe('全部工程')
     expect(scopeLabel({ level: 'unit', unitId: 'u1' }, wbsById)).toBe('导流洞')
     expect(scopeLabel({ level: 'item', itemId: 'i1' }, wbsById, processById)).toBe('土石方洞挖（导流洞1#施工支洞）')
     expect(scopeLabel({ level: 'item', itemId: 'i1', processId: 'pb' }, wbsById, processById)).toContain('出渣')
+    expect(scopeLabel({ level: 'item', itemId: 'i1', chainage: '545-548' }, wbsById, processById)).toContain(
+      '桩号 545-548'
+    )
   })
 })
 

@@ -9,6 +9,7 @@
  */
 import { isActive } from '@/core/compute'
 import { shortItemLabel, shortSpot } from '@/core/scope'
+import { recordChainage, shortChainageText } from '@/core/chainage'
 import { hhmmToMinutes } from '@/core/time'
 import type { ISODate, Process, ProcessRecord, WbsNode } from '@/types'
 
@@ -42,6 +43,8 @@ export interface RingSegment {
   itemName: string
   /** 工作面短名，如 "1#支洞" */
   itemShort: string
+  /** 简洁桩号，如 "545-548"；历史无桩号时为空 */
+  chainage: string
   /** 着色维度对应的名字（按工作面着色=分项短名，按工序着色=工序名） */
   colorKey: string
   color: string
@@ -144,6 +147,7 @@ export function buildDayRing(input: DayRingInput): DayRingData {
       name: p.name,
       itemName,
       itemShort: shortSpot(itemName),
+      chainage: shortChainageText(recordChainage(r)),
       colorKey: input.byProcess ? p.name : shortItemLabel(itemName),
       color: RING_PALETTE[0],
       startMin,

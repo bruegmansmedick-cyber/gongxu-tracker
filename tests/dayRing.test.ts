@@ -161,6 +161,15 @@ describe('24 小时圆盘配色与图例', () => {
     expect(data.segments.map((s) => s.colorKey)).toEqual(['装药爆破', '出渣'])
     expect(data.segments.map((s) => s.itemShort)).toEqual(['1#支洞', '1#支洞'])
   })
+
+  it('详情分段带上简洁桩号，历史无桩号时为空', () => {
+    const data = ring([
+      { ...rec('r1', 'p-blast', '08:00', '10:00', 2), chainage: '0+545~0+548' },
+      rec('r2', 'p-muck', '10:00', '12:00', 2)
+    ])
+    expect(data.segments.find((s) => s.recordId === 'r1')?.chainage).toBe('545-548')
+    expect(data.segments.find((s) => s.recordId === 'r2')?.chainage).toBe('')
+  })
 })
 
 describe('扇弧路径', () => {

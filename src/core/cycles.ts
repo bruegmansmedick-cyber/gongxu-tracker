@@ -11,7 +11,7 @@
  * 纯函数，不读写数据库。
  */
 import { isActive } from '@/core/compute'
-import { mergeChainages } from '@/core/chainage'
+import { mergeChainages, recordChainage, shortChainageText } from '@/core/chainage'
 import { addDays } from '@/core/time'
 import type { ISODate, Process, ProcessRecord } from '@/types'
 
@@ -177,7 +177,7 @@ export function buildCycles(records: ProcessRecord[], processById: Map<string, P
           CYCLE_IDLE_GAP_HOURS * HOUR
         )
         const spanHours = Math.max(0, (boundaryEndAt - cur.startAt) / HOUR)
-        const chain = mergeChainages(block.map((r) => r.location))
+        const chain = mergeChainages(block.map(recordChainage))
         const chainageLengthM = chain.lengthM > 0 ? chain.lengthM : null
         cycles.push({
           id: `${family}-${itemId}-${cur.startAt}`,
@@ -219,14 +219,18 @@ export function summarizeCycles(cycles: Cycle[], family?: CycleFamily): CycleSum
   }
 }
 
-/** tooltip 里的桩号/工作量一行：支护轮没填桩号时提示可补填 */
+/** 图例里的短桩号：多段时最多展示两段 */
+export function cycleChainageLabel(c: Cycle): string {
+  const rows = c.chainages.map(shortChainageText)
+  if (!rows.length) return ''
+  return rows.slice(0, 2).join(' / ') + (rows.length > 2 ? ` 等${rows.length}段` : '')
+}
+
+/** tooltip 里的桩号/工作量一行：无桩号时保持原有提示 */
 export function cycleChainageText(c: Cycle): string {
-  if (c.family !== 'sup') {
-    return c.chainages.length ? `桩号 ${c.chainages.slice(0, 3).join(' / ')}` : ''
-  }
-  if (!c.chainages.length) return '桩号未填（可到明细补填）'
+  if (!c.chainages.length) return c.family === 'sup' ? '桩号未填（可到明细补填）' : ''
   const more = c.chainages.length > 3 ? ` 等 ${c.chainages.length} 段` : ''
   const len = c.chainageLengthM ? `（${c.chainageLengthM.toFixed(1)}m）` : ''
   const hpm = c.hoursPerMeter ? `· ${c.hoursPerMeter.toFixed(2)}h/m` : ''
-  return `桩号 ${c.chainages.slice(0, 3).join(' / ')}${more}${len}${hpm}`
+  return `桩号 ${c.chainages.slice(0, 3).map(shortChainageText).join(' / ')}${more}${len}${hpm}`
 }

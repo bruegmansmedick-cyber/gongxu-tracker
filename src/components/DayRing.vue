@@ -92,7 +92,11 @@ const labels = computed(() =>
         stroke-width="0.8"
         class="ring-seg"
         @click="emit('pick', s.recordId)"
-      />
+      >
+        <title>
+          {{ s.timeLabel }} {{ s.name }}（{{ s.itemShort }}{{ s.chainage ? ' · ' + s.chainage : '' }}）
+        </title>
+      </path>
 
       <text :x="C" :y="C - 12" text-anchor="middle" class="ring-center-date">{{ dateLabel }}</text>
       <text :x="C" :y="C + 8" text-anchor="middle" class="ring-center-big">{{ fmtHoursShort(data.stats.hours) }}</text>
@@ -114,7 +118,10 @@ const labels = computed(() =>
       >
         <span class="dot" :style="{ background: s.color }" />
         <span class="time num">{{ s.timeLabel }}</span>
-        <span class="name">{{ s.name }}<span class="muted">（{{ s.itemShort }}）</span></span>
+        <span class="name">
+          {{ s.name }}
+          <span class="muted">（{{ s.itemShort }}<template v-if="s.chainage"> · {{ s.chainage }}</template>）</span>
+        </span>
         <span class="hours num">{{ fmtHoursShort(s.hours) }}</span>
       </button>
     </div>

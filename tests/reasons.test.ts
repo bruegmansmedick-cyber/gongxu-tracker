@@ -12,6 +12,7 @@ function gap(reason: string, hours = 1): GapRow {
     prevProcessName: '钻孔',
     itemId: 'i1',
     location: '',
+    chainage: '',
     gapHours: hours,
     reason
   }

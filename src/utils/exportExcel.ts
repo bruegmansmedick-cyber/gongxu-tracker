@@ -9,6 +9,7 @@ import {
   weekPeriods
 } from '@/core/compute'
 import { reasonLabel } from '@/core/reasons'
+import { recordChainage, shortChainageText } from '@/core/chainage'
 import { fmtHoursShort, monthKey, parseDate } from '@/core/time'
 import { buildXlsx, type CellValue } from '@/utils/xlsx'
 import { downloadBlob, stamp } from '@/utils/download'
@@ -53,7 +54,10 @@ export function exportProjectExcel(opts: ExportOptions): void {
     '净用时(h)',
     '工程量',
     '单位',
-    '部位/桩号',
+    '桩号',
+    '部位补充',
+    '等待开始',
+    '等待结束',
     '衔接空隙(h)',
     '前道工序',
     '间隙原因',
@@ -77,7 +81,10 @@ export function exportProjectExcel(opts: ExportOptions): void {
         Number(r.hours.toFixed(2)),
         r.quantity ?? null,
         p?.unit ?? '',
+        shortChainageText(recordChainage(r)),
         r.location ?? '',
+        r.gapStartTime ?? '',
+        r.gapEndTime ?? '',
         gap ? Number(gap.gapHours.toFixed(2)) : 0,
         gap?.prevProcessName ?? '',
         reasonLabel(r.gapReason),
@@ -143,7 +150,7 @@ export function exportProjectExcel(opts: ExportOptions): void {
     ])
 
   // 4) 衔接空隙明细
-  const gapHeader: CellValue[] = ['日期', '前道工序', '本工序', '空隙(h)', '间隙原因', '部位/桩号']
+  const gapHeader: CellValue[] = ['日期', '前道工序', '本工序', '空隙(h)', '间隙原因', '桩号', '部位补充']
   const gapDetailRows = gapRows
     .filter((g) => g.gapHours > 0)
     .sort((a, b) => b.gapHours - a.gapHours)
@@ -155,6 +162,7 @@ export function exportProjectExcel(opts: ExportOptions): void {
           g.processName,
           Number(g.gapHours.toFixed(2)),
           reasonLabel(g.reason),
+          g.chainage,
           g.location
         ] as CellValue[]
     )

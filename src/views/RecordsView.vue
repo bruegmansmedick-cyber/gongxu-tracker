@@ -6,6 +6,7 @@ import { getKv, setKv } from '@/db'
 import { state } from '@/store'
 import { computeGapRows, daySummaries } from '@/core/compute'
 import { filterByScope } from '@/core/scope'
+import { recordChainage, shortChainageText } from '@/core/chainage'
 import { reasonLabel } from '@/core/reasons'
 import { addMonths, endOfMonth, fmtDate, fmtHoursShort, friendlyDate, monthKey, parseDate, todayStr } from '@/core/time'
 
@@ -54,6 +55,8 @@ const filtered = computed(() => {
         const p = processById.value.get(r.processId)
         return (
           (p?.name ?? '').includes(kw) ||
+          recordChainage(r).includes(kw) ||
+          shortChainageText(recordChainage(r)).includes(kw) ||
           (r.location ?? '').includes(kw) ||
           (r.note ?? '').includes(kw)
         )
@@ -253,7 +256,7 @@ watch(
       </div>
     </div>
 
-    <van-search v-model="keyword" placeholder="搜索工序 / 部位 / 备注" />
+    <van-search v-model="keyword" placeholder="搜索工序 / 桩号 / 备注" />
 
     <div v-if="summaries.length" class="card list-head">
       <span class="muted">{{ summaries.length }} 天有记录</span>
@@ -300,11 +303,15 @@ watch(
             <div class="muted">{{ pathOf(r.processId) }}</div>
             <div class="muted">
               {{ r.startTime }} - {{ r.endTime }}
-              <template v-if="r.location"> · {{ r.location }}</template>
+              <template v-if="recordChainage(r)"> · 桩号 {{ shortChainageText(recordChainage(r)) }}</template>
+              <template v-if="r.location && r.location !== recordChainage(r)"> · {{ r.location }}</template>
               <template v-if="r.operatorName"> · {{ r.operatorName }}</template>
             </div>
             <div v-if="(gapByRecord.get(r.id) ?? 0) > 0" class="muted gap">
               衔接空隙 {{ fmtHoursShort(gapByRecord.get(r.id) ?? 0) }}
+              <template v-if="r.gapStartTime && r.gapEndTime">
+                （等待 {{ r.gapStartTime }} - {{ r.gapEndTime }}）
+              </template>
               <template v-if="r.gapReason && r.gapReason !== 'none'">（{{ reasonLabel(r.gapReason) }}）</template>
             </div>
           </div>

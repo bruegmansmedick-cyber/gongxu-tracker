@@ -5,6 +5,7 @@
  */
 import type { Process, ProcessRecord, WbsNode } from '@/types'
 import { baselineHoursOf, isActive } from '@/core/compute'
+import { chainageOverlaps, mergeChainages, recordChainage, shortChainageText } from '@/core/chainage'
 
 export type ScopeLevel = 'all' | 'unit' | 'item'
 
@@ -16,6 +17,8 @@ export interface AnalysisScope {
   itemId?: string
   /** 选定分项工程后可再筛具体工序，留空表示全部工序 */
   processId?: string
+  /** 按桩号区间筛选；留空表示全部桩号 */
+  chainage?: string
 }
 
 export const ALL_SCOPE: AnalysisScope = { level: 'all' }
@@ -34,23 +37,24 @@ export function filterByScope(
   wbsById: Map<string, WbsNode>
 ): ProcessRecord[] {
   const rows = records.filter(isActive)
-  if (scope.level === 'all') return rows
-  if (scope.level === 'unit') {
-    if (!scope.unitId) return rows
-    return rows.filter((r) => {
+  let scoped = rows
+  if (scope.level === 'unit' && scope.unitId) {
+    scoped = rows.filter((r) => {
       const p = processById.get(r.processId)
       if (!p) return false
       return unitIdOfItem(p.itemId, wbsById) === scope.unitId
     })
+  } else if (scope.level === 'item' && scope.itemId) {
+    scoped = rows.filter((r) => {
+      const p = processById.get(r.processId)
+      if (!p) return false
+      if (p.itemId !== scope.itemId) return false
+      if (scope.processId && p.id !== scope.processId) return false
+      return true
+    })
   }
-  if (!scope.itemId) return rows
-  return rows.filter((r) => {
-    const p = processById.get(r.processId)
-    if (!p) return false
-    if (p.itemId !== scope.itemId) return false
-    if (scope.processId && p.id !== scope.processId) return false
-    return true
-  })
+  if (!scope.chainage) return scoped
+  return scoped.filter((r) => chainageOverlaps(recordChainage(r), scope.chainage))
 }
 
 /** 范围内的工序 id 集合；null 表示不限制 */
@@ -76,14 +80,15 @@ export function scopeLabel(
   wbsById: Map<string, WbsNode>,
   processById?: Map<string, Process>
 ): string {
-  if (scope.level === 'all') return '全部工程'
-  if (scope.level === 'unit') return wbsById.get(scope.unitId ?? '')?.name ?? '未知单位工程'
-  const item = wbsById.get(scope.itemId ?? '')?.name ?? '未知分项工程'
-  if (scope.processId) {
-    const proc = processById?.get(scope.processId)
-    return proc ? `${item} · ${proc.name}` : item
+  let label = '全部工程'
+  if (scope.level === 'unit') label = wbsById.get(scope.unitId ?? '')?.name ?? '未知单位工程'
+  if (scope.level === 'item') {
+    const item = wbsById.get(scope.itemId ?? '')?.name ?? '未知分项工程'
+    const proc = scope.processId ? processById?.get(scope.processId) : undefined
+    label = proc ? `${item} · ${proc.name}` : item
   }
-  return item
+  if (scope.chainage) label += ` · 桩号 ${shortChainageText(scope.chainage)}`
+  return label
 }
 
 /** 把"土石方洞挖（导流洞1#施工支洞）"压成"1#支洞开挖"，用于图例 / 饼图 */
@@ -128,6 +133,7 @@ export interface ItemAgg {
   count: number
   actualHours: number
   baselineHours: number
+  chainages: string[]
 }
 
 /** 按分项工程汇总工时（整体视图的堆叠柱与饼图用） */
@@ -137,6 +143,7 @@ export function aggregateByItem(
   wbsById: Map<string, WbsNode>
 ): ItemAgg[] {
   const map = new Map<string, ItemAgg>()
+  const chainageValues = new Map<string, string[]>()
   records.filter(isActive).forEach((r) => {
     const p = processById.get(r.processId)
     if (!p) return
@@ -152,14 +159,25 @@ export function aggregateByItem(
         unitName: unit?.name ?? '',
         count: 0,
         actualHours: 0,
-        baselineHours: 0
+        baselineHours: 0,
+        chainages: []
       } satisfies ItemAgg)
     cur.count += 1
     cur.actualHours += Number.isFinite(r.hours) ? r.hours : 0
     cur.baselineHours += baselineHoursOf(p) ?? 0
+    const chain = recordChainage(r)
+    if (chain) {
+      const values = chainageValues.get(p.itemId) ?? []
+      values.push(chain)
+      chainageValues.set(p.itemId, values)
+    }
     map.set(p.itemId, cur)
   })
-  return Array.from(map.values()).sort((a, b) => b.actualHours - a.actualHours)
+  const out = Array.from(map.values())
+  out.forEach((row) => {
+    row.chainages = mergeChainages(chainageValues.get(row.itemId) ?? []).ranges.map(shortChainageText)
+  })
+  return out.sort((a, b) => b.actualHours - a.actualHours)
 }
 
 export interface StackedSeries {

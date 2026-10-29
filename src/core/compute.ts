@@ -1,5 +1,6 @@
 import type { HHMM, ISODate, Process, ProcessRecord, WbsNode } from '@/types'
 import { GAP_TOLERANCE_MINUTES, reasonColor, reasonLabel } from '@/core/reasons'
+import { mergeChainages, recordChainage, shortChainageText } from '@/core/chainage'
 import {
   addDays,
   addMonths,
@@ -79,6 +80,7 @@ export interface GapRow {
   prevProcessName: string
   itemId: string
   location: string
+  chainage: string
   gapHours: number
   reason: string
 }
@@ -86,6 +88,15 @@ export interface GapRow {
 export interface GapKey {
   itemId: string
   location: string
+}
+
+/** 人工填写的开工前等待时长；未成对填写时返回 null */
+export function manualGapHoursOf(record: Pick<ProcessRecord, 'gapStartTime' | 'gapEndTime'>): number | null {
+  if (!record.gapStartTime || !record.gapEndTime) return null
+  const start = hhmmToMinutes(record.gapStartTime)
+  let end = hhmmToMinutes(record.gapEndTime)
+  if (end < start) end += 1440
+  return (end - start) / 60
 }
 
 /** 衔接空隙的分组依据：分项工程（本标段里一个分项工程就是一个工作面） */
@@ -117,26 +128,35 @@ export function computeGapRows(
   const rows: GapRow[] = []
   groups.forEach((list) => {
     list.sort((a, b) => a.startAt - b.startAt)
-    for (let i = 1; i < list.length; i += 1) {
-      const prev = list[i - 1]
+    for (let i = 0; i < list.length; i += 1) {
       const cur = list[i]
-      const raw = (cur.startAt - prev.endAt) / 3600000
-      if (raw > GAP_MAX_HOURS) continue
-      const gapHours = Math.max(0, raw)
+      const prev = i > 0 ? list[i - 1] : undefined
+      const manual = manualGapHoursOf(cur)
+      let gapHours: number
+      if (manual !== null) {
+        // 人工填的是实际等待区间，优先于前后工序时差，也不受 6 小时停工上限影响。
+        gapHours = Math.max(0, manual)
+      } else {
+        if (!prev) continue
+        const raw = (cur.startAt - prev.endAt) / 3600000
+        if (raw > GAP_MAX_HOURS) continue
+        gapHours = Math.max(0, raw)
+      }
       if (gapHours < minGapHours) continue
       const p = processById.get(cur.processId)
-      const prevP = processById.get(prev.processId)
+      const prevP = prev ? processById.get(prev.processId) : undefined
       rows.push({
         recordId: cur.id,
-        prevRecordId: prev.id,
+        prevRecordId: prev?.id ?? '',
         date: cur.date,
         processId: cur.processId,
         processName: p?.name ?? '未知工序',
-        prevProcessName: prevP?.name ?? '未知工序',
+        prevProcessName: prevP?.name ?? '开工前',
         itemId: p?.itemId ?? '',
         location: cur.location ?? '',
+        chainage: shortChainageText(recordChainage(cur)),
         gapHours,
-        reason: cur.gapReason ?? ''
+        reason: cur.gapReason === 'none' ? '' : (cur.gapReason ?? '')
       })
     }
   })
@@ -256,6 +276,8 @@ export interface ProcessAgg {
   deviation: number | null
   quantity: number
   designQty: number | null
+  /** 本工序记录涉及的桩号（简写，已合并） */
+  chainages: string[]
 }
 
 export function aggregateByProcess(
@@ -264,6 +286,7 @@ export function aggregateByProcess(
   wbsById: Map<string, WbsNode>
 ): ProcessAgg[] {
   const map = new Map<string, ProcessAgg>()
+  const chainageValues = new Map<string, string[]>()
   activeRecords(records).forEach((r) => {
     const p = processById.get(r.processId)
     if (!p) return
@@ -289,15 +312,23 @@ export function aggregateByProcess(
         baselineKind: baselineKindOf(p),
         deviation: null,
         quantity: 0,
-        designQty: p.designQty ?? null
+        designQty: p.designQty ?? null,
+        chainages: []
       } satisfies ProcessAgg)
     cur.count += 1
     cur.actualHours += Number.isFinite(r.hours) ? r.hours : 0
     cur.quantity += Number(r.quantity) || 0
+    const chain = recordChainage(r)
+    if (chain) {
+      const values = chainageValues.get(p.id) ?? []
+      values.push(chain)
+      chainageValues.set(p.id, values)
+    }
     map.set(p.id, cur)
   })
   const out = Array.from(map.values())
   out.forEach((row) => {
+    row.chainages = mergeChainages(chainageValues.get(row.processId) ?? []).ranges.map(shortChainageText)
     if (row.standardHours && row.standardHours > 0) {
       row.standardTotal = row.standardHours * row.count
     }
@@ -346,6 +377,7 @@ export interface GapAgg {
   gapHours: number
   reason: string
   location: string
+  chainage: string
 }
 
 export function topGaps(gaps: GapRow[], limit = 10): GapAgg[] {
@@ -361,7 +393,8 @@ export function topGaps(gaps: GapRow[], limit = 10): GapAgg[] {
       date: g.date,
       gapHours: g.gapHours,
       reason: g.reason,
-      location: g.location
+      location: g.location,
+      chainage: g.chainage
     }))
 }
 

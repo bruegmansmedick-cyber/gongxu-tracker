@@ -19,6 +19,9 @@ const input: RecordDraftInput = {
   endInput: '',
   quantity: '2.5',
   gapReason: '等监理旁站',
+  gapStartTime: '07:20',
+  gapEndTime: '07:55',
+  chainage: '545-548',
   location: '0+413~0+438',
   note: '完工后再补'
 }
@@ -30,6 +33,8 @@ describe('工序记录暂存', () => {
     expect(draft.version).toBe(1)
     expect(draft.savedAt).toBe(123)
     expect(draft.endInput).toBe('')
+    expect(draft.chainage).toBe('545-548')
+    expect(draft.gapStartTime).toBe('07:20')
   })
 
   it('能校验本机恢复值', () => {

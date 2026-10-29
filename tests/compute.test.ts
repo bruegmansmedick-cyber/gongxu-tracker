@@ -100,6 +100,61 @@ describe('computeGapRows', () => {
     ]
     expect(computeGapRows(rows, processes)).toHaveLength(0)
   })
+
+  it('人工等待起止优先于前后工序时差，即使超过 6 小时也保留', () => {
+    const rows = [
+      rec({ id: 'r1', processId: 'a', date: '2026-09-30', startTime: '08:00', endTime: '09:00' }),
+      rec({
+        id: 'r2',
+        processId: 'b',
+        date: '2026-09-30',
+        startTime: '20:00',
+        endTime: '22:00',
+        gapStartTime: '09:00',
+        gapEndTime: '20:00',
+        chainage: '545-548'
+      })
+    ]
+    const gaps = computeGapRows(rows, processes)
+    expect(gaps).toHaveLength(1)
+    expect(gaps[0].gapHours).toBe(11)
+    expect(gaps[0].chainage).toBe('545-548')
+  })
+
+  it('首条工序也能直接记录开工前等待', () => {
+    const rows = [
+      rec({
+        id: 'r1',
+        processId: 'a',
+        date: '2026-09-30',
+        startTime: '08:00',
+        endTime: '12:00',
+        gapStartTime: '06:30',
+        gapEndTime: '07:45'
+      })
+    ]
+    const gaps = computeGapRows(rows, processes)
+    expect(gaps).toHaveLength(1)
+    expect(gaps[0].prevProcessName).toBe('开工前')
+    expect(gaps[0].gapHours).toBeCloseTo(1.25, 5)
+  })
+
+  it('等待起止相同记为 0，不当成跨零点 24 小时', () => {
+    const rows = [
+      rec({
+        id: 'r1',
+        processId: 'a',
+        date: '2026-09-30',
+        startTime: '08:00',
+        endTime: '12:00',
+        gapStartTime: '07:00',
+        gapEndTime: '07:00'
+      })
+    ]
+    const gaps = computeGapRows(rows, processes)
+    expect(gaps).toHaveLength(1)
+    expect(gaps[0].gapHours).toBe(0)
+  })
 })
 
 describe('computeStats 双口径效率', () => {
