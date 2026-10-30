@@ -123,6 +123,19 @@ const groups = computed<Group[]>(() => {
   })
   return Array.from(map.values())
 })
+/** 今日大类默认折叠，避免多条记录把首屏拉得很长。 */
+const expandedGroups = ref<Set<string>>(new Set())
+
+function isGroupExpanded(itemId: string): boolean {
+  return expandedGroups.value.has(itemId)
+}
+
+function toggleGroup(itemId: string) {
+  const next = new Set(expandedGroups.value)
+  if (next.has(itemId)) next.delete(itemId)
+  else next.add(itemId)
+  expandedGroups.value = next
+}
 
 /**
  * 最近两周用过的工序，按分项工程（工作面）分成小组，用于一键补录。
@@ -414,23 +427,35 @@ async function onRefresh() {
           <van-empty v-if="!groups.length && !pendingRecords.length" description="今天还没有记录" image-size="72" />
 
           <div v-for="g in groups" :key="g.itemId" class="group">
-            <div class="group-head">
-              <span>{{ g.divisionName ? g.divisionName + ' / ' : '' }}{{ g.itemName }}</span>
-              <span class="num muted">{{ fmtHoursShort(g.totalHours) }}</span>
-            </div>
-            <div v-for="r in g.records" :key="r.id" class="record-row" @click="editRecord(r.id)">
-              <div class="record-main">
-                <div class="record-name">{{ processById.get(r.processId)?.name ?? '未知工序' }}</div>
-                <div class="muted">
-                  {{ r.startTime }} - {{ r.endTime }}
-                  <template v-if="r.location"> · {{ r.location }}</template>
-                  <template v-if="r.quantity"> · {{ r.quantity }}{{ processById.get(r.processId)?.unit ?? '' }}</template>
+            <button
+              type="button"
+              class="group-head"
+              :aria-expanded="isGroupExpanded(g.itemId)"
+              :aria-controls="`group-${g.itemId}`"
+              @click="toggleGroup(g.itemId)"
+            >
+              <span class="group-title">{{ g.divisionName ? g.divisionName + ' / ' : '' }}{{ g.itemName }}</span>
+              <span class="group-meta">
+                <span class="num">{{ fmtHoursShort(g.totalHours) }}</span>
+                <span class="group-count">{{ g.records.length }} 道</span>
+                <van-icon :name="isGroupExpanded(g.itemId) ? 'arrow-up' : 'arrow-down'" />
+              </span>
+            </button>
+            <div v-if="isGroupExpanded(g.itemId)" :id="`group-${g.itemId}`">
+              <div v-for="r in g.records" :key="r.id" class="record-row" @click="editRecord(r.id)">
+                <div class="record-main">
+                  <div class="record-name">{{ processById.get(r.processId)?.name ?? '未知工序' }}</div>
+                  <div class="muted">
+                    {{ r.startTime }} - {{ r.endTime }}
+                    <template v-if="r.location"> · {{ r.location }}</template>
+                    <template v-if="r.quantity"> · {{ r.quantity }}{{ processById.get(r.processId)?.unit ?? '' }}</template>
+                  </div>
+                  <div v-if="r.gapReason && r.gapReason !== 'none'" class="muted">
+                    开工前等待：{{ reasonLabel(r.gapReason) }}
+                  </div>
                 </div>
-                <div v-if="r.gapReason && r.gapReason !== 'none'" class="muted">
-                  开工前等待：{{ reasonLabel(r.gapReason) }}
-                </div>
+                <div class="record-hours num">{{ fmtHoursShort(r.hours) }}</div>
               </div>
-              <div class="record-hours num">{{ fmtHoursShort(r.hours) }}</div>
             </div>
           </div>
         </div>
@@ -475,7 +500,8 @@ async function onRefresh() {
 
 <style scoped>
 .group + .group {
-  margin-top: 14px;
+  margin-top: 4px;
+  border-top: 1px solid #f0f2f5;
 }
 
 .today-label {
@@ -500,12 +526,42 @@ async function onRefresh() {
 }
 
 .group-head {
+  width: 100%;
   display: flex;
+  align-items: center;
   justify-content: space-between;
+  gap: 12px;
+  padding: 11px 0;
+  border: 0;
+  background: transparent;
+  color: #1b2430;
+  text-align: left;
+}
+
+.group-head:active {
+  background: #f8f9fb;
+}
+
+.group-title {
+  min-width: 0;
+  flex: 1;
+  font-size: 14px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+
+.group-meta {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: #1f6feb;
   font-size: 13px;
-  font-weight: 600;
-  color: #3d4650;
-  padding: 6px 0;
+}
+
+.group-count {
+  color: #8b95a1;
+  font-size: 12px;
 }
 
 .record-row {

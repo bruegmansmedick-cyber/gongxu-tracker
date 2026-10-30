@@ -21,7 +21,12 @@ const themeVars = {
 <template>
   <van-config-provider :theme-vars="themeVars">
     <div class="app-shell">
-      <router-view />
+      <router-view v-slot="{ Component }">
+        <keep-alive :max="5">
+          <component :is="Component" v-if="route.meta.tab" :key="route.name" />
+        </keep-alive>
+        <component :is="Component" v-if="!route.meta.tab" :key="route.fullPath" />
+      </router-view>
 
       <div v-if="state.sync.pending && state.sync.configured" class="sync-ribbon" @click="$router.push('/settings')">
         <van-icon name="cloud-o" />

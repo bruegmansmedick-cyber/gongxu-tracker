@@ -809,6 +809,7 @@ async function save() {
     await afterChange('records')
     // 只清除当前这张表单对应的草稿，其他工作面的暂存继续保留。
     if (!recordId.value && draftId.value) await removeStoredDraft()
+    const editingExisting = Boolean(recordId.value)
     const isToday = date.value === todayStr()
     if (recordId.value) {
       showToast('已保存修改')
@@ -818,6 +819,10 @@ async function save() {
       showToast('记录已保存')
     } else {
       showToast(`已保存 ${friendlyDate(date.value)} 的记录（不在“今日”列表里）`)
+    }
+    if (editingExisting) {
+      leaveRecordView(date.value)
+      return
     }
     // 补填历史日期时直接跳到那个月的明细，免得以为没存上
     if (!isToday) router.replace({ path: '/records', query: { month: date.value.slice(0, 7) } })
@@ -835,7 +840,17 @@ async function remove() {
   await removeRecord(recordId.value)
   await afterChange('records')
   showToast('已删除')
-  router.replace('/records')
+  leaveRecordView(date.value)
+}
+
+/** 编辑/删除后原路返回；直接打开链接没有历史时，退回对应月份明细。 */
+function leaveRecordView(recordDate: string) {
+  const historyState = window.history.state as { back?: string | null } | null
+  if (historyState?.back) {
+    router.back()
+    return
+  }
+  router.replace({ path: '/records', query: { month: recordDate.slice(0, 7) } })
 }
 
 /** 由工序反推它所属的单位 / 分部 / 分项（编辑记录、从别处带参数进来时用） */
@@ -967,7 +982,13 @@ onMounted(() => {
 </script>
 
 <template>
-  <van-nav-bar :title="recordId ? '修改工序记录' : '记录工序用时'" left-arrow fixed placeholder @click-left="router.back()" />
+  <van-nav-bar
+    :title="recordId ? '修改工序记录' : '记录工序用时'"
+    left-arrow
+    fixed
+    placeholder
+    @click-left="leaveRecordView(date)"
+  />
 
   <div class="page">
     <div v-if="draftSavedAt && !recordId" class="draft-banner">

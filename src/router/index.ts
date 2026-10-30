@@ -12,7 +12,9 @@ const router = createRouter({
     { path: '/security', name: 'security', component: () => import('@/views/SecurityView.vue') },
     { path: '/:pathMatch(.*)*', redirect: '/' }
   ],
-  scrollBehavior: () => ({ top: 0 })
+  scrollBehavior(_to, _from, savedPosition) {
+    return savedPosition ?? { top: 0 }
+  }
 })
 
 export default router
