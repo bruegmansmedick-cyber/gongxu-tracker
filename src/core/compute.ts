@@ -25,14 +25,41 @@ export interface TimeFields {
   hours: number
 }
 
+export type CompletedProcessRecord = ProcessRecord & {
+  endTime: HHMM
+  endAt: number
+  hours: number
+  endPending?: never
+}
+
+/** 只有起止时刻都有效、且不是待补完工的记录，才能参与工时和循环计算。 */
+export function isCompleteRecord(r: ProcessRecord): r is CompletedProcessRecord {
+  return (
+    !r.endPending &&
+    typeof r.endTime === 'string' &&
+    r.endTime.length > 0 &&
+    typeof r.endAt === 'number' &&
+    Number.isFinite(r.endAt) &&
+    typeof r.hours === 'number' &&
+    Number.isFinite(r.hours)
+  )
+}
+
+export function isEndPending(r: ProcessRecord): boolean {
+  return !isCompleteRecord(r)
+}
+
+export function buildStartAt(date: ISODate, start: HHMM): number {
+  return parseDate(date).getTime() + hhmmToMinutes(start) * 60000
+}
+
 /** 由 日期 + 开工时刻 + 完工时刻 推出时间戳与净用时；完工不晚于开工则视为跨零点 */
 export function buildTimeFields(date: ISODate, start: HHMM, end: HHMM): TimeFields {
-  const base = parseDate(date).getTime()
   const sm = hhmmToMinutes(start)
   let em = hhmmToMinutes(end)
   if (em <= sm) em += 1440
-  const startAt = base + sm * 60000
-  const endAt = base + em * 60000
+  const startAt = buildStartAt(date, start)
+  const endAt = parseDate(date).getTime() + em * 60000
   return { startAt, endAt, hours: (endAt - startAt) / 3600000 }
 }
 
@@ -66,7 +93,9 @@ export function filterByRange(records: ProcessRecord[], from: ISODate, to: ISODa
 
 /** 兼容历史数据：缺少 startAt/endAt/hours 时按起止时刻补算 */
 export function ensureTimes(r: ProcessRecord): ProcessRecord {
-  if (r.startAt && r.endAt && Number.isFinite(r.hours)) return r
+  if (r.endPending) return { ...r, endTime: undefined, endAt: undefined, hours: undefined }
+  if (!r.endTime) return { ...r, endPending: 1, endAt: undefined, hours: undefined }
+  if (r.endAt && Number.isFinite(r.endAt) && Number.isFinite(r.hours)) return r
   const t = buildTimeFields(r.date, r.startTime, r.endTime)
   return { ...r, ...t }
 }
@@ -115,8 +144,8 @@ export function computeGapRows(
   opts: { minGapMinutes?: number } = {}
 ): GapRow[] {
   const minGapHours = (opts.minGapMinutes ?? 0) / 60
-  const groups = new Map<string, ProcessRecord[]>()
-  activeRecords(records).forEach((r) => {
+  const groups = new Map<string, CompletedProcessRecord[]>()
+  activeRecords(records).filter(isCompleteRecord).forEach((r) => {
     const p = processById.get(r.processId)
     if (!p) return
     const key = gapGroupKey(p.itemId)
@@ -166,7 +195,10 @@ export function computeGapRows(
 export interface PeriodStats {
   from: ISODate
   to: ISODate
+  /** 已完成、参与工时计算的记录数 */
   recordCount: number
+  /** 同期已上传但待补完工的记录数，不计入 recordCount */
+  pendingCount: number
   actualHours: number
   /** 只统计填了标准用时的记录 */
   standardHours: number
@@ -193,6 +225,7 @@ export function computeStats(
   to: ISODate
 ): PeriodStats {
   const rows = filterByRange(records, from, to)
+  const completeRows = rows.filter(isCompleteRecord)
   let actualHours = 0
   let standardHours = 0
   let standardCovered = 0
@@ -202,9 +235,10 @@ export function computeStats(
   let quantity = 0
   const deviations: number[] = []
   const days = new Set<string>()
+  const pendingCount = rows.length - completeRows.length
 
-  rows.forEach((r) => {
-    const hours = Number.isFinite(r.hours) ? r.hours : 0
+  completeRows.forEach((r) => {
+    const hours = r.hours
     actualHours += hours
     quantity += Number(r.quantity) || 0
     days.add(r.date)
@@ -238,7 +272,8 @@ export function computeStats(
   return {
     from,
     to,
-    recordCount: rows.length,
+    recordCount: completeRows.length,
+    pendingCount,
     actualHours,
     standardHours,
     standardCovered,
@@ -287,7 +322,7 @@ export function aggregateByProcess(
 ): ProcessAgg[] {
   const map = new Map<string, ProcessAgg>()
   const chainageValues = new Map<string, string[]>()
-  activeRecords(records).forEach((r) => {
+  activeRecords(records).filter(isCompleteRecord).forEach((r) => {
     const p = processById.get(r.processId)
     if (!p) return
     const item = wbsById.get(p.itemId)
@@ -316,7 +351,7 @@ export function aggregateByProcess(
         chainages: []
       } satisfies ProcessAgg)
     cur.count += 1
-    cur.actualHours += Number.isFinite(r.hours) ? r.hours : 0
+    cur.actualHours += r.hours
     cur.quantity += Number(r.quantity) || 0
     const chain = recordChainage(r)
     if (chain) {
@@ -401,8 +436,8 @@ export function topGaps(gaps: GapRow[], limit = 10): GapAgg[] {
 /** 每个日期的实际工时（日历热力图用） */
 export function hoursByDate(records: ProcessRecord[]): Map<ISODate, number> {
   const map = new Map<ISODate, number>()
-  activeRecords(records).forEach((r) => {
-    map.set(r.date, (map.get(r.date) ?? 0) + (Number.isFinite(r.hours) ? r.hours : 0))
+  activeRecords(records).filter(isCompleteRecord).forEach((r) => {
+    map.set(r.date, (map.get(r.date) ?? 0) + r.hours)
   })
   return map
 }
@@ -424,7 +459,7 @@ export function daySummaries(records: ProcessRecord[], gapByRecord: Map<string, 
   activeRecords(records).forEach((r) => {
     const row = map.get(r.date) ?? { date: r.date, count: 0, hours: 0, gapHours: 0 }
     row.count += 1
-    row.hours += Number.isFinite(r.hours) ? r.hours : 0
+    if (isCompleteRecord(r)) row.hours += r.hours
     row.gapHours += gapByRecord.get(r.id) ?? 0
     map.set(r.date, row)
   })
@@ -489,7 +524,7 @@ export function completionByItem(
   wbsById: Map<string, WbsNode>
 ): ItemProgress[] {
   const map = new Map<string, ItemProgress>()
-  activeRecords(records).forEach((r) => {
+  activeRecords(records).filter(isCompleteRecord).forEach((r) => {
     const p = processById.get(r.processId)
     if (!p) return
     const item = wbsById.get(p.itemId)
@@ -507,7 +542,7 @@ export function completionByItem(
         actualHours: 0
       } satisfies ItemProgress)
     cur.doneQty += Number(r.quantity) || 0
-    cur.actualHours += Number.isFinite(r.hours) ? r.hours : 0
+    cur.actualHours += r.hours
     map.set(p.itemId, cur)
   })
   const out = Array.from(map.values())
@@ -527,10 +562,10 @@ export function suggestStandardHours(
   records: ProcessRecord[]
 ): { value: number | null; sample: number; used: number } {
   const list = activeRecords(records)
+    .filter(isCompleteRecord)
     .filter(
       (r) =>
         r.processId === processId &&
-        Number.isFinite(r.hours) &&
         r.hours >= REF_MIN_HOURS &&
         r.hours <= REF_MAX_HOURS
     )

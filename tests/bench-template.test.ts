@@ -9,7 +9,7 @@ import {
   refHoursOf
 } from '@/db/seed'
 import { HISTORY_ROWS, buildHistoryRecords, historyProcessId } from '@/db/history'
-import { computeStats } from '@/core/compute'
+import { computeStats, isCompleteRecord } from '@/core/compute'
 import { mergeSyncable } from '@/sync/merge'
 import type { Process, ProcessRecord } from '@/types'
 
@@ -139,7 +139,9 @@ describe('历史记录补录', () => {
 
   it('跨零点、等待原因、部位都带过来了', () => {
     const rows = buildHistoryRecords('prj-1')
-    const cross = rows.filter((r) => r.endAt - r.startAt > 0 && r.startTime > r.endTime)
+    const cross = rows
+      .filter(isCompleteRecord)
+      .filter((r) => r.endAt - r.startAt > 0 && r.startTime > r.endTime)
     expect(cross.length).toBeGreaterThan(10)
     const withReason = rows.filter((r) => r.gapReason && r.gapReason !== 'none')
     expect(withReason.length).toBeGreaterThanOrEqual(30)

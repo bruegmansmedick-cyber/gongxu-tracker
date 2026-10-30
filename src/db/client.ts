@@ -1,6 +1,7 @@
 /** Dexie 实例与最基础的键值读写（独立成模块，避免各表模块之间循环引用） */
 import Dexie, { type Table } from 'dexie'
 import type { AuditEntry } from '@/db/audit'
+import type { RecordDraft } from '@/core/recordDraft'
 import type { KvRow, Operator, Process, ProcessRecord, Project, WbsNode, Workface } from '@/types'
 
 export class AppDB extends Dexie {
@@ -12,6 +13,7 @@ export class AppDB extends Dexie {
   audit!: Table<AuditEntry, string>
   kv!: Table<KvRow, string>
   workfaces!: Table<Workface, string>
+  recordDrafts!: Table<RecordDraft, string>
 
   constructor() {
     super('gongxu-tracker')
@@ -30,6 +32,10 @@ export class AppDB extends Dexie {
     // v3：新增工作面表；wbs 增加可选 workfaceId（无需改索引，旧数据原样保留）
     this.version(3).stores({
       workfaces: 'id, projectId, unitId, [projectId+unitId], updatedAt'
+    })
+    // v4：多条可同步草稿；旧 ui.recordDraft 在启动时无损迁移
+    this.version(4).stores({
+      recordDrafts: 'id, projectId, updatedAt, deletedAt'
     })
   }
 }

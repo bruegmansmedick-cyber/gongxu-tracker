@@ -30,9 +30,14 @@ import { createStore } from '@/sync/stores'
 import { listAudit } from '@/db/audit'
 import { exportProjectExcel } from '@/utils/exportExcel'
 import { downloadText, pickFile, readFileText, stamp } from '@/utils/download'
+import { isCompleteRecord, isEndPending } from '@/core/compute'
 import { endOfMonth, fmtDate, fmtHoursShort, monthKey, startOfMonth, todayStr } from '@/core/time'
 
 const busy = ref('')
+const totalHours = computed(() =>
+  state.records.reduce((sum, row) => sum + (isCompleteRecord(row) ? row.hours : 0), 0)
+)
+const pendingCount = computed(() => state.records.filter(isEndPending).length)
 const syncCfg = reactive<SyncConfig>({
   backend: 'gitee',
   githubToken: '',
@@ -340,7 +345,7 @@ function quickAll() {
         </span>
       </div>
       <div class="muted" style="margin-bottom: 10px">
-        每次同步都会先合并云端和本机的数据（按每条记录的时间取新），再上传变化部分，所以两台手机分别记录也不会互相覆盖。
+        每次同步都会先合并云端和本机的记录及暂存（按更新时间取新），再上传变化部分，所以两台手机分别记录也不会互相覆盖。
       </div>
       <van-tabs v-model:active="syncCfg.backend" type="card" @change="persistSync">
         <van-tab title="Gitee（国内推荐）" name="gitee" />
@@ -461,8 +466,9 @@ function quickAll() {
     <div class="card">
       <div class="card-title">本机数据</div>
       <div class="muted">
-        当前项目 {{ project?.name ?? '—' }} · 记录 {{ state.records.length }} 条 · 工序 {{ state.processes.length }} 条 ·
-        累计工时 {{ fmtHoursShort(state.records.reduce((s, r) => s + r.hours, 0)) }}
+        当前项目 {{ project?.name ?? '—' }} · 记录 {{ state.records.length }} 条（待补 {{ pendingCount }}） ·
+        工序 {{ state.processes.length }} 条 ·
+        累计工时 {{ fmtHoursShort(totalHours) }}
       </div>
       <div class="btn-grid" style="margin-top: 10px">
         <van-button size="small" type="danger" plain @click="doWipe">清空本机数据</van-button>
@@ -473,7 +479,7 @@ function quickAll() {
       <div class="card-title">使用说明</div>
       <div class="muted">
         1. 在“工程”页新建项目，可一键套用水利通用模板，再按实际增删工序。<br />
-        2. 首页点“+”记录工序用时，填开工与完工时刻，程序自动算用时；若完工早于开工则视为跨零点。<br />
+        2. 首页点“+”记录工序用时，可先填开工并暂不填完工；正式保存后显示为“待补完工”，补齐前不计工时。<br />
         3. 同一分项工程内按开工时间排序，相邻两道工序之间的空档即为“衔接空隙”，开工前等待的原因记在本条记录上。<br />
         4. 效率两个口径：总量口径 = Σ标准用时 ÷ Σ实际用时 − 1；工序平均口径 = 各工序（标准−实际）÷标准 的平均。<br />
         5. 建议用手机浏览器“添加到主屏幕”作为主入口，微信里打开的链接作为分享入口。

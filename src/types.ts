@@ -80,13 +80,16 @@ export interface ProcessRecord extends Syncable {
   /** 施工日期，按自然日归属 */
   date: ISODate
   startTime: HHMM
-  endTime: HHMM
   /** 由 date+startTime 推出的时间戳 */
   startAt: number
+  /** 待补完工记录没有这些字段；补齐后再按正常记录计算 */
+  endTime?: HHMM
   /** 跨零点时自动 +1 天 */
-  endAt: number
+  endAt?: number
   /** 净用时（小时），由起止时刻算出 */
-  hours: number
+  hours?: number
+  /** 已正式上传，但交接班/停工后尚未填写结束时间 */
+  endPending?: 1
   quantity?: number
   /** 本工序开工前等待的原因标签 key */
   gapReason?: string
@@ -132,6 +135,13 @@ export interface RecordsPayload {
   month: string
   updatedAt: number
   records: ProcessRecord[]
+}
+
+/** 云端 drafts.json 的结构 */
+export interface DraftsPayload {
+  schemaVersion: 1
+  updatedAt: number
+  drafts: import('@/core/recordDraft').RecordDraft[]
 }
 
 export interface MetaPayload {

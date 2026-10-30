@@ -11,7 +11,7 @@
  *
  * 纯函数，不读写数据库。
  */
-import { isActive } from '@/core/compute'
+import { isActive, isCompleteRecord, type CompletedProcessRecord } from '@/core/compute'
 import { chainageOverlaps, mergeChainages, recordChainage, shortChainageText } from '@/core/chainage'
 import { shortItemLabel } from '@/core/scope'
 import { addDays } from '@/core/time'
@@ -101,7 +101,7 @@ export function familyOfKey(key: string): CycleFamily | null {
 }
 
 /** 记录的完工日：跨零点（endTime ≤ startTime）归到次日 */
-function endDateOfRecord(record: ProcessRecord): ISODate {
+function endDateOfRecord(record: CompletedProcessRecord): ISODate {
   return record.endTime <= record.startTime ? addDays(record.date, 1) : record.date
 }
 
@@ -117,8 +117,8 @@ function groupKeyOf(itemId: string, context: CycleContext): string {
  * 否则桩号缺失会把一轮拆成两轮、日期边界会截断跨天循环。
  */
 export function buildCycles(records: ProcessRecord[], context: CycleContext): Cycle[] {
-  const groups = new Map<string, ProcessRecord[]>()
-  records.filter(isActive).forEach((r) => {
+  const groups = new Map<string, CompletedProcessRecord[]>()
+  records.filter(isActive).filter(isCompleteRecord).forEach((r) => {
     const p = context.processById.get(r.processId)
     if (!p) return
     const key = groupKeyOf(p.itemId, context)

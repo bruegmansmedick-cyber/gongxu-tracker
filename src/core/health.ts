@@ -3,7 +3,12 @@
  * 纯函数，便于单测；不修改任何数据。
  */
 import type { Process, ProcessRecord, WbsNode } from '@/types'
-import { activeRecords, baselineHoursOf } from '@/core/compute'
+import {
+  activeRecords,
+  baselineHoursOf,
+  isCompleteRecord,
+  type CompletedProcessRecord
+} from '@/core/compute'
 
 export type HealthLevel = 'high' | 'mid' | 'low'
 
@@ -15,6 +20,7 @@ export type HealthRule =
   | 'big-gap'
   | 'qty-without-time'
   | 'duplicate'
+  | 'pending-end'
 
 export interface HealthIssue {
   /** 稳定 id：同一条问题重复扫描不会变，便于"已核实"标记 */
@@ -36,7 +42,8 @@ export const HEALTH_RULE_LABEL: Record<HealthRule, string> = {
   overlap: '与上一条工序时间重叠',
   'big-gap': '与上一条工序间隔过长',
   'qty-without-time': '有工程量但用时不足 5 分钟',
-  duplicate: '同一工序重复录入'
+  duplicate: '同一工序重复录入',
+  'pending-end': '待补完工时间'
 }
 
 export const MAX_SINGLE_HOURS = 12
@@ -56,12 +63,27 @@ export function scanHealth(
   wbsById: Map<string, WbsNode>
 ): HealthIssue[] {
   const rows = activeRecords(records)
+  const completeRows = rows.filter(isCompleteRecord)
   const issues: HealthIssue[] = []
   const nameOf = (r: ProcessRecord) => processById.get(r.processId)?.name ?? '未知工序'
   const itemOf = (r: ProcessRecord) => itemNameOf(processById.get(r.processId), wbsById)
 
   // 1) 单条时长异常
-  rows.forEach((r) => {
+  rows.filter((r) => !isCompleteRecord(r)).forEach((r) => {
+    issues.push({
+      id: `pending-${r.id}`,
+      rule: 'pending-end',
+      level: 'mid',
+      recordId: r.id,
+      processName: nameOf(r),
+      itemName: itemOf(r),
+      date: r.date,
+      title: `${nameOf(r)} 待补完工时间`,
+      detail: `${r.date} ${r.startTime} 开工，交接班或停工后尚未填写完工时刻`
+    })
+  })
+
+  completeRows.forEach((r) => {
     if (r.hours > MAX_SINGLE_HOURS) {
       issues.push({
         id: `too-long-${r.id}`,
@@ -104,7 +126,7 @@ export function scanHealth(
 
   // 2) 同一天同一工作面合计超 24 小时
   const dayMap = new Map<string, { hours: number; itemName: string; date: string; records: string[] }>()
-  rows.forEach((r) => {
+  completeRows.forEach((r) => {
     const itemId = processById.get(r.processId)?.itemId ?? ''
     const key = `${itemId}|${r.date}`
     const cur = dayMap.get(key) ?? { hours: 0, itemName: itemOf(r), date: r.date, records: [] }
@@ -128,8 +150,8 @@ export function scanHealth(
   })
 
   // 3) 相邻工序重叠 / 间隔过长 / 重复录入
-  const groups = new Map<string, ProcessRecord[]>()
-  rows.forEach((r) => {
+  const groups = new Map<string, CompletedProcessRecord[]>()
+  completeRows.forEach((r) => {
     const itemId = processById.get(r.processId)?.itemId
     if (!itemId) return
     const list = groups.get(itemId) ?? []
@@ -208,6 +230,7 @@ export function checkBeforeSave(
     warnings.push(`本条用时 ${hours.toFixed(1)} 小时，超过 ${MAX_SINGLE_HOURS} 小时，请确认时间是否填错`)
   }
   const siblings = activeRecords(records)
+    .filter(isCompleteRecord)
     .filter((r) => r.id !== draft.id && processById.get(r.processId)?.itemId === itemId)
     .sort((a, b) => a.startAt - b.startAt)
   const before = [...siblings].reverse().find((r) => r.startAt <= draft.startAt)

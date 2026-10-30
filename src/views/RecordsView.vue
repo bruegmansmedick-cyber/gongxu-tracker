@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router'
 import ScopePicker from '@/components/ScopePicker.vue'
 import { getKv, setKv } from '@/db'
 import { state } from '@/store'
-import { computeGapRows, daySummaries } from '@/core/compute'
+import { computeGapRows, daySummaries, isCompleteRecord, isEndPending } from '@/core/compute'
 import { filterByScope, scopeLabel } from '@/core/scope'
 import { buildItemWorkfaceMap } from '@/core/workface'
 import { recordChainage, shortChainageText } from '@/core/chainage'
@@ -73,10 +73,11 @@ const filtered = computed(() => {
 /** 顶部统计跟随筛选结果，避免数字和列表对不上 */
 const filteredStats = computed(() => {
   const rows = filtered.value
-  const hours = rows.reduce((s, r) => s + (Number.isFinite(r.hours) ? r.hours : 0), 0)
+  const hours = rows.reduce((s, r) => s + (isCompleteRecord(r) ? r.hours : 0), 0)
   const gap = rows.reduce((s, r) => s + (gapByRecord.value.get(r.id) ?? 0), 0)
   const days = new Set(rows.map((r) => r.date)).size
-  return { count: rows.length, hours, gap, days }
+  const pending = rows.filter(isEndPending).length
+  return { count: rows.length, hours, gap, days, pending }
 })
 
 const scopeName = computed(() => scopeLabel(state.scope, wbsById.value, workfaceById.value))
@@ -252,6 +253,7 @@ watch(
       </div>
       <div class="muted" style="margin-top: 6px">
         衔接空隙合计 {{ fmtHoursShort(filteredStats.gap) }} · 有记录天数 {{ filteredStats.days }} 天
+        <template v-if="filteredStats.pending"> · 待补完工 {{ filteredStats.pending }} 条（不计工时）</template>
         <template v-if="searching"> （已按“{{ keyword }}”筛选）</template>
       </div>
     </div>
@@ -298,11 +300,12 @@ watch(
           <div class="row-main">
             <div class="row-name">
               {{ processById.get(r.processId)?.name ?? '未知工序' }}
+              <span v-if="isEndPending(r)" class="tag-soft pending-tag">待补完工</span>
               <span v-if="r.quantity" class="tag-soft">{{ r.quantity }}{{ processById.get(r.processId)?.unit ?? '' }}</span>
             </div>
             <div class="muted">{{ pathOf(r.processId) }}</div>
             <div class="muted">
-              {{ r.startTime }} - {{ r.endTime }}
+              {{ r.startTime }} - {{ r.endTime ?? '待补' }}
               <template v-if="recordChainage(r)"> · 桩号 {{ shortChainageText(recordChainage(r)) }}</template>
               <template v-if="r.location && r.location !== recordChainage(r)"> · {{ r.location }}</template>
               <template v-if="r.operatorName"> · {{ r.operatorName }}</template>
@@ -315,7 +318,8 @@ watch(
               <template v-if="r.gapReason && r.gapReason !== 'none'">（{{ reasonLabel(r.gapReason) }}）</template>
             </div>
           </div>
-          <div class="row-hours num">{{ fmtHoursShort(r.hours) }}</div>
+          <div v-if="isCompleteRecord(r)" class="row-hours num">{{ fmtHoursShort(r.hours) }}</div>
+          <div v-else class="row-hours pending-hours">未完工</div>
         </div>
       </div>
     </div>
@@ -431,6 +435,16 @@ watch(
   font-weight: 600;
   color: #1f6feb;
   white-space: nowrap;
+}
+
+.pending-tag {
+  color: #9a4f00;
+  background: #fff1e4;
+}
+
+.pending-hours {
+  color: #9a4f00;
+  font-size: 13px;
 }
 
 .gap {

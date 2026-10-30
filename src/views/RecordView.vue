@@ -3,7 +3,17 @@ import { computed, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { showConfirmDialog, showToast } from 'vant'
 import { afterChange, state } from '@/store'
-import { deleteRecord as removeRecord, delKv, getKv, getRecord, saveProcess, saveRecord, setKv } from '@/db'
+import {
+  deleteRecord as removeRecord,
+  deleteRecordDraft,
+  getKv,
+  getRecord,
+  getRecordDraft,
+  saveProcess,
+  saveRecord,
+  saveRecordDraft,
+  setKv
+} from '@/db'
 import { buildTimeFields, manualGapHoursOf, suggestStandardHours } from '@/core/compute'
 import { checkBeforeSave } from '@/core/health'
 import { parseChainageRange, recommendNextChainage } from '@/core/chainage'
@@ -11,13 +21,7 @@ import { familyOfKey, processKeyOf } from '@/core/cycles'
 import { GAP_REASONS, MAX_CUSTOM_REASONS, mergeCustomReasons } from '@/core/reasons'
 import { recommendProcesses, rememberProcess, type ProcessMemory } from '@/core/recommend'
 import { buildUsageIndex, predictSelection, rankByUsage } from '@/core/predict'
-import {
-  RECORD_DRAFT_KEY,
-  isRecordDraft,
-  makeRecordDraft,
-  shouldRestoreRecordDraft,
-  type RecordDraftInput
-} from '@/core/recordDraft'
+import type { RecordDraftInput } from '@/core/recordDraft'
 import { addDays, fmtDate, fmtHours, friendlyDate, nowHhmm, parseLooseTime, todayStr } from '@/core/time'
 import type { Process, WbsLevel, WbsNode } from '@/types'
 
@@ -33,7 +37,7 @@ const processId = ref('')
 
 const date = ref(todayStr())
 const startTime = ref('08:00')
-const endTime = ref('12:00')
+const endTime = ref('')
 /** 输入框里的原始文字；失焦或保存时再校验并写回 startTime / endTime */
 const startInput = ref(startTime.value)
 const endInput = ref(endTime.value)
@@ -52,7 +56,8 @@ const location = ref('')
 const locationError = ref('')
 const note = ref('')
 const saving = ref(false)
-/** 当前本机草稿的暂存时间；0 表示本次表单没有恢复/保存草稿 */
+/** 当前草稿 id 与暂存时间；空 id 表示这是一张尚未暂存的新表单 */
+const draftId = ref('')
 const draftSavedAt = ref(0)
 const NEXT_CHAINAGE_KEY = 'ui.nextChainage'
 
@@ -196,8 +201,12 @@ const currentPickId = computed(() => {
   return itemId.value
 })
 
-const hours = computed(() => buildTimeFields(date.value, startTime.value, endTime.value).hours)
+const hours = computed(() => {
+  if (!endTime.value) return null
+  return buildTimeFields(date.value, startTime.value, endTime.value).hours
+})
 const crossMidnight = computed(() => {
+  if (!endTime.value) return false
   const [sh, sm] = startTime.value.split(':').map(Number)
   const [eh, em] = endTime.value.split(':').map(Number)
   return eh * 60 + em <= sh * 60 + sm
@@ -349,7 +358,7 @@ function pickProcess(p: Process) {
 
 /** 上一条循环末工序保存后预留的下一段桩号，只在本机用于下一次新建 */
 async function prefillNextChainage(targetItemId = itemId.value) {
-  if (!targetItemId || recordId.value || chainage.value.trim() || draftSavedAt.value) return
+  if (!targetItemId || recordId.value || chainage.value.trim() || draftId.value) return
   const saved = await getKv<NextChainageMemory | null>(NEXT_CHAINAGE_KEY, null)
   if (saved?.itemId === targetItemId && saved.value) {
     chainage.value = saved.value
@@ -516,8 +525,18 @@ function commitTime(kind: TimeKind): boolean {
 
 function commitTimes(): boolean {
   const okStart = commitTime('start')
-  const okEnd = commitTime('end')
+  const okEnd = commitOptionalEnd()
   return okStart && okEnd
+}
+
+function commitOptionalEnd(): boolean {
+  const hasEnd = Boolean(endInput.value.trim())
+  if (!hasEnd) {
+    endTime.value = ''
+    timeInvalid.end = false
+    return true
+  }
+  return commitTime('end')
 }
 
 function commitGapTimes(): boolean {
@@ -611,25 +630,31 @@ function draftSnapshot(): RecordDraftInput {
   }
 }
 
-/** 只暂存到本机 IndexedDB；刷新、离开页面后再回来仍能恢复。 */
+/** 每条暂存都有独立 id；保存或删除只影响当前这条。 */
 async function saveDraft() {
   if (recordId.value) return
   if (!state.currentProjectId) {
     showToast('请先选择项目')
     return
   }
-  const savedAt = Date.now()
   try {
-    await setKv(RECORD_DRAFT_KEY, makeRecordDraft(draftSnapshot(), savedAt))
-    draftSavedAt.value = savedAt
-    showToast('已暂存，可在首页“今日工序记录”继续填写')
+    const saved = await saveRecordDraft({
+      ...draftSnapshot(),
+      id: draftId.value || undefined
+    })
+    draftId.value = saved.id
+    draftSavedAt.value = saved.updatedAt
+    await afterChange('drafts')
+    showToast('已暂存，可在首页“暂存记录”继续填写')
   } catch {
     showToast('暂存失败，请稍后再试')
   }
 }
 
 async function removeStoredDraft() {
-  await delKv(RECORD_DRAFT_KEY)
+  if (draftId.value) await deleteRecordDraft(draftId.value)
+  await afterChange('drafts')
+  draftId.value = ''
   draftSavedAt.value = 0
 }
 
@@ -637,7 +662,7 @@ async function discardDraft() {
   try {
     await showConfirmDialog({
       title: '清除暂存',
-      message: '只会清除本机保存的草稿，当前页面填写的内容仍保留。确定清除吗？',
+      message: '只清除首页中的这条暂存，当前页面填写的内容仍保留。确定清除吗？',
       confirmButtonText: '清除'
     })
   } catch {
@@ -647,9 +672,12 @@ async function discardDraft() {
   showToast('暂存已清除')
 }
 
-async function restoreDraft() {
-  const raw = await getKv<unknown>(RECORD_DRAFT_KEY, null)
-  if (!isRecordDraft(raw) || raw.projectId !== state.currentProjectId) return
+async function restoreDraft(id: string) {
+  const raw = await getRecordDraft(id)
+  if (!raw || raw.projectId !== state.currentProjectId) {
+    showToast('这条暂存不存在或已被其他设备删除')
+    return false
+  }
 
   const processApplied = raw.processId ? applyProcess(raw.processId) : false
   if (!processApplied) {
@@ -665,8 +693,8 @@ async function restoreDraft() {
 
   date.value = raw.date || todayStr()
   startTime.value = raw.startTime || '08:00'
-  endTime.value = raw.endTime || '12:00'
-  // 完工时刻允许先留空，恢复时不能被默认 12:00 偷偷补回去。
+  endTime.value = raw.endTime || ''
+  // 完工时刻允许先留空，恢复时不能填入默认时刻。
   startInput.value = raw.startInput
   endInput.value = raw.endInput
   timeInvalid.start = false
@@ -684,8 +712,10 @@ async function restoreDraft() {
   location.value = raw.location
   locationError.value = ''
   note.value = raw.note
+  draftId.value = raw.id
   draftSavedAt.value = raw.savedAt
-  showToast('已恢复上次暂存')
+  showToast('已恢复这条暂存')
+  return true
 }
 
 async function save() {
@@ -724,12 +754,20 @@ async function save() {
   try {
     const op = state.operators.find((o) => o.id === state.currentOperatorId)
     // 保存前做一次衔接体检：重叠 / 间隔过长 / 重复录入 → 先让人确认
-    const times = buildTimeFields(date.value, startTime.value, endTime.value)
-    const warnings = checkBeforeSave(
-      { id: recordId.value ?? undefined, processId: processId.value, date: date.value, startAt: times.startAt, endAt: times.endAt },
-      state.records,
-      processById.value
-    )
+    const times = endTime.value ? buildTimeFields(date.value, startTime.value, endTime.value) : null
+    const warnings = times
+      ? checkBeforeSave(
+          {
+            id: recordId.value ?? undefined,
+            processId: processId.value,
+            date: date.value,
+            startAt: times.startAt,
+            endAt: times.endAt
+          },
+          state.records,
+          processById.value
+        )
+      : []
     if (warnings.length) {
       try {
         await showConfirmDialog({
@@ -748,7 +786,7 @@ async function save() {
       processId: processId.value,
       date: date.value,
       startTime: startTime.value,
-      endTime: endTime.value,
+      endTime: endTime.value || undefined,
       quantity: quantity.value === '' ? undefined : Number(quantity.value),
       gapReason: gapReason.value,
       gapStartTime: gapStartTime.value || undefined,
@@ -769,11 +807,13 @@ async function save() {
       })
     }
     await afterChange('records')
-    // 只有这一张表单本身就是草稿时才清除；从常用工序另存新记录不能误删旧草稿。
-    if (!recordId.value && draftSavedAt.value) await removeStoredDraft()
+    // 只清除当前这张表单对应的草稿，其他工作面的暂存继续保留。
+    if (!recordId.value && draftId.value) await removeStoredDraft()
     const isToday = date.value === todayStr()
     if (recordId.value) {
       showToast('已保存修改')
+    } else if (!endTime.value) {
+      showToast('已保存，待补完工时间')
     } else if (isToday) {
       showToast('记录已保存')
     } else {
@@ -833,7 +873,7 @@ async function loadFromQuery() {
   const pid = typeof q.processId === 'string' ? q.processId : ''
   const wantedItem = typeof q.itemId === 'string' ? q.itemId : ''
   const d = typeof q.date === 'string' ? q.date : ''
-  const resumeDraft = q.draft === '1'
+  const wantedDraftId = typeof q.draftId === 'string' ? q.draftId : ''
 
   recordId.value = null
   unitId.value = ''
@@ -846,7 +886,7 @@ async function loadFromQuery() {
   predictedHint.value = ''
   date.value = d || todayStr()
   startTime.value = '08:00'
-  endTime.value = '12:00'
+  endTime.value = ''
   startInput.value = startTime.value
   endInput.value = endTime.value
   timeInvalid.start = false
@@ -864,6 +904,7 @@ async function loadFromQuery() {
   location.value = ''
   locationError.value = ''
   note.value = ''
+  draftId.value = ''
   draftSavedAt.value = 0
 
   if (pid) {
@@ -885,9 +926,9 @@ async function loadFromQuery() {
       }
       date.value = row.date
       startTime.value = row.startTime
-      endTime.value = row.endTime
+      endTime.value = row.endTime ?? ''
       startInput.value = row.startTime
-      endInput.value = row.endTime
+      endInput.value = row.endTime ?? ''
       quantity.value = row.quantity === undefined ? '' : String(row.quantity)
       gapReason.value = row.gapReason ?? 'none'
       gapStartTime.value = row.gapStartTime ?? ''
@@ -903,10 +944,10 @@ async function loadFromQuery() {
   startInput.value = startTime.value
   endInput.value = endTime.value
 
-  // 首页加号显式恢复草稿；编辑旧记录、快捷工序或指定日期入口以本次选择为准。
-  if (shouldRestoreRecordDraft({ id, processId: pid, itemId: wantedItem, date: d, resumeDraft })) {
-    await restoreDraft()
-    if (!chainage.value.trim()) await prefillNextChainage()
+  // 首页加号打开空白表单；只有点击某条暂存时才用 draftId 明确恢复。
+  if (wantedDraftId) {
+    const restored = await restoreDraft(wantedDraftId)
+    if (restored && !chainage.value.trim()) await prefillNextChainage()
   } else if (!id) {
     await prefillNextChainage()
   }
@@ -932,7 +973,7 @@ onMounted(() => {
     <div v-if="draftSavedAt && !recordId" class="draft-banner">
       <div>
         <b>已暂存</b>
-        <span>{{ draftSavedLabel }} · 返回首页可从今日记录继续，正式保存后清除</span>
+        <span>{{ draftSavedLabel }} · 首页“暂存记录”可继续填写，正式保存后只清除这一条</span>
       </div>
       <van-button size="mini" plain type="primary" @click="discardDraft">清除</van-button>
     </div>
@@ -1020,8 +1061,9 @@ onMounted(() => {
           </div>
         </template>
       </van-field>
-      <div class="time-pair">
+      <div class="process-time-stack">
         <van-field
+          class="process-time-row"
           :model-value="startInput"
           label="开工"
           type="text"
@@ -1038,16 +1080,16 @@ onMounted(() => {
           </template>
         </van-field>
         <van-field
+          class="process-time-row"
           :model-value="endInput"
           label="完工"
           type="text"
           inputmode="numeric"
           maxlength="5"
-          placeholder="12:00"
+          placeholder="可留空，稍后补填"
           :error-message="timeInvalid.end ? '格式不对' : ''"
-          required
           @update:model-value="onTimeInput('end', $event)"
-          @blur="commitTime('end')"
+          @blur="commitOptionalEnd"
         >
           <template #button>
             <van-button class="now-button" size="mini" plain type="primary" @click.stop="fillNowEnd">现在</van-button>
@@ -1056,11 +1098,16 @@ onMounted(() => {
       </div>
       <van-field label="净用时">
         <template #input>
-          <span class="num" style="font-size: 17px; font-weight: 600; color: #1f6feb">{{ fmtHours(hours) }}</span>
+          <span v-if="hours !== null" class="num" style="font-size: 17px; font-weight: 600; color: #1f6feb">
+            {{ fmtHours(hours) }}
+          </span>
+          <span v-else class="pending-time">— · 未完工</span>
           <span v-if="crossMidnight" class="tag-soft" style="margin-left: 8px">跨零点</span>
         </template>
       </van-field>
-      <div class="time-hint muted">左右两格可直接输入 08:30 或 830；完工早于开工自动按跨零点算。</div>
+      <div class="time-hint muted">
+        可直接输入 08:30 或 830；完工可留空，先上传为“待补完工”。完工早于开工自动按跨零点算。
+      </div>
     </van-cell-group>
 
     <van-cell-group inset style="margin-top: 12px">
@@ -1368,6 +1415,33 @@ onMounted(() => {
   color: #62789a;
 }
 
+.process-time-stack :deep(.process-time-row) {
+  min-height: 56px;
+  padding-top: 8px;
+  padding-bottom: 8px;
+}
+
+.process-time-stack :deep(.process-time-row + .process-time-row) {
+  border-top: 1px solid #f0f2f5;
+}
+
+.process-time-stack :deep(.van-field__label) {
+  width: 4.5em;
+  margin-right: 10px;
+  font-size: 14px;
+}
+
+.process-time-stack :deep(.van-field__control) {
+  min-height: 32px;
+  font-size: 16px;
+}
+
+.pending-time {
+  color: #b26a00;
+  font-size: 14px;
+  font-weight: 600;
+}
+
 .time-pair {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
@@ -1399,9 +1473,11 @@ onMounted(() => {
 }
 
 .now-button {
-  padding-left: 6px;
-  padding-right: 6px;
-  font-size: 11px;
+  min-height: 44px;
+  min-width: 52px;
+  padding-left: 12px;
+  padding-right: 12px;
+  font-size: 13px;
 }
 
 .time-hint {

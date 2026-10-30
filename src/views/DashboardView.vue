@@ -11,6 +11,8 @@ import { state } from '@/store'
 import {
   computeGapRows,
   computeStats,
+  isCompleteRecord,
+  isEndPending,
   topGaps,
   type PeriodRange
 } from '@/core/compute'
@@ -460,6 +462,7 @@ const combinedChartOption = computed<EChartsOption>(() => {
 
 // --------------------------------------------------------------- 问题排查
 const gapRows = computed(() => computeGapRows(inRange.value, processById.value))
+const pendingInRange = computed(() => inRange.value.filter(isEndPending))
 const gapTop = computed(() =>
   topGaps(gapRows.value, 8).map((g) => ({
     ...g,
@@ -477,9 +480,9 @@ const singleWorkface = computed(() => state.scope.level === 'workface' && Boolea
 const exceedDays = computed(() => {
   if (!singleWorkface.value) return []
   const map = new Map<string, { date: string; hours: number; count: number }>()
-  inRange.value.forEach((r) => {
+  inRange.value.filter(isCompleteRecord).forEach((r) => {
     const row = map.get(r.date) ?? { date: r.date, hours: 0, count: 0 }
-    row.hours += Number.isFinite(r.hours) ? r.hours : 0
+    row.hours += r.hours
     row.count += 1
     map.set(r.date, row)
   })
@@ -947,6 +950,35 @@ onMounted(() => {
 
     <!-- -------------------------------------------------------- 问题排查 -->
     <template v-else>
+      <div class="card">
+        <div class="card-title">
+          待补完工
+          <span class="sub">已上传，完工前不计工时</span>
+        </div>
+        <div v-if="pendingInRange.length" class="issue-list">
+          <button
+            v-for="r in pendingInRange"
+            :key="r.id"
+            type="button"
+            class="issue-row as-button"
+            :aria-label="`补填 ${r.date} ${processById.get(r.processId)?.name ?? '工序'} 的完工时间`"
+            @click="openRecord(r.id)"
+          >
+            <div class="issue-main">
+              <div class="issue-title">
+                {{ faceNameOf(itemWorkface.get(processById.get(r.processId)?.itemId ?? '')) || shortItemLabel(wbsById.get(processById.get(r.processId)?.itemId ?? '')?.name ?? '未归类') }}
+                · {{ processById.get(r.processId)?.name ?? '未知工序' }}
+              </div>
+              <div class="muted">
+                {{ r.date }} {{ r.startTime }} 开工 · {{ shortChainageText(recordChainage(r)) || '桩号未填' }}
+              </div>
+            </div>
+            <span class="missing-tag">待补</span>
+          </button>
+        </div>
+        <div v-else class="muted empty-line">本期没有待补完工记录</div>
+      </div>
+
       <div class="card">
         <div class="card-title">
           异常：单日工时超过 24 小时

@@ -2,17 +2,20 @@ import { reactive } from 'vue'
 import type { Operator, Process, ProcessRecord, Project, WbsNode, Workface } from '@/types'
 import {
   ensureDeviceId,
+  ensureLegacyRecordDraftMigrated,
   ensureWorkfaces,
   getKv,
   listOperators,
   listProcesses,
   listProjects,
+  listRecordDrafts,
   listRecords,
   listWbs,
   listWorkfaces,
   saveOperator,
   setKv
 } from '@/db'
+import type { RecordDraft } from '@/core/recordDraft'
 import { syncNow, syncState as readSyncState, type SyncBackend } from '@/sync'
 import { ALL_SCOPE, normalizeScope, type AnalysisScope } from '@/core/scope'
 import { buildItemWorkfaceMap } from '@/core/workface'
@@ -40,6 +43,8 @@ interface AppState {
   wbs: WbsNode[]
   processes: Process[]
   records: ProcessRecord[]
+  /** 当前项目的全部未完成暂存，不限日期 */
+  drafts: RecordDraft[]
   /** 工作面：分项工程按洞室 / 部位归组 */
   workfaces: Workface[]
   sync: SyncViewState
@@ -57,6 +62,7 @@ export const state = reactive<AppState>({
   wbs: [] as WbsNode[],
   processes: [] as Process[],
   records: [] as ProcessRecord[],
+  drafts: [] as RecordDraft[],
   workfaces: [] as Workface[],
   sync: {
     configured: false,
@@ -74,7 +80,7 @@ export const state = reactive<AppState>({
 
 let syncTimer: number | undefined
 
-export type ChangeScope = 'all' | 'structure' | 'records' | 'projects' | 'operators'
+export type ChangeScope = 'all' | 'structure' | 'records' | 'drafts' | 'projects' | 'operators'
 
 /** 任何本地写操作之后调用：刷新受影响的数据、打上待同步标记并安排自动同步 */
 export async function afterChange(scope: ChangeScope = 'all'): Promise<void> {
@@ -83,10 +89,12 @@ export async function afterChange(scope: ChangeScope = 'all'): Promise<void> {
     await refreshStructure()
     await refreshRecords()
   } else if (scope === 'records') await refreshRecords()
+  else if (scope === 'drafts') await refreshDrafts()
   else if (scope === 'projects') {
     await refreshProjects()
     await refreshStructure()
     await refreshRecords()
+    await refreshDrafts()
   } else await refreshOperators()
   await refreshSyncState()
   scheduleSync()
@@ -139,10 +147,19 @@ export async function refreshRecords(): Promise<void> {
   state.records = await listRecords(state.currentProjectId)
 }
 
+export async function refreshDrafts(): Promise<void> {
+  if (!state.currentProjectId) {
+    state.drafts = []
+    return
+  }
+  state.drafts = await listRecordDrafts(state.currentProjectId)
+}
+
 export async function refreshAll(): Promise<void> {
   await Promise.all([refreshProjects(), refreshOperators()])
   await refreshStructure()
   await refreshRecords()
+  await refreshDrafts()
   await refreshSyncState()
 }
 
@@ -153,6 +170,7 @@ export async function setProject(id: string): Promise<void> {
   await setScope({ ...ALL_SCOPE })
   await refreshStructure()
   await refreshRecords()
+  await refreshDrafts()
 }
 
 /** 分析范围（看板 / 明细页共用，本机持久化，不参与同步） */
@@ -186,6 +204,7 @@ export async function refreshSyncState(): Promise<void> {
 
 export async function initApp(): Promise<void> {
   state.deviceId = await ensureDeviceId()
+  await ensureLegacyRecordDraftMigrated()
   state.currentProjectId = await getKv<string>('ui.currentProjectId', '')
   state.currentOperatorId = await getKv<string>('ui.currentOperatorId', '')
   await refreshAll()

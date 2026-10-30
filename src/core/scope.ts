@@ -9,7 +9,7 @@
  * 记录 → 工序 → 分项工程 → 工作面：记录不直接挂工作面，因此历史数据不需要改写。
  */
 import type { Process, ProcessRecord, WbsNode, Workface } from '@/types'
-import { baselineHoursOf, isActive } from '@/core/compute'
+import { baselineHoursOf, isActive, isCompleteRecord } from '@/core/compute'
 import { chainageOverlaps, mergeChainages, parseChainageRange, recordChainage, shortChainageText } from '@/core/chainage'
 import { chainageKey, chainageOptionLabel, workfaceLabel } from '@/core/workface'
 
@@ -180,7 +180,7 @@ export function aggregateByItem(
 ): ItemAgg[] {
   const map = new Map<string, ItemAgg>()
   const chainageValues = new Map<string, string[]>()
-  records.filter(isActive).forEach((r) => {
+  records.filter(isActive).filter(isCompleteRecord).forEach((r) => {
     const p = processById.get(r.processId)
     if (!p) return
     const item = wbsById.get(p.itemId)
@@ -202,7 +202,7 @@ export function aggregateByItem(
         chainages: []
       } satisfies ItemAgg)
     cur.count += 1
-    cur.actualHours += Number.isFinite(r.hours) ? r.hours : 0
+    cur.actualHours += r.hours
     cur.baselineHours += baselineHoursOf(p) ?? 0
     const chain = recordChainage(r)
     if (chain) {
@@ -238,7 +238,7 @@ export function aggregateByWorkface(
 ): WorkfaceAgg[] {
   const map = new Map<string, WorkfaceAgg>()
   const chainageValues = new Map<string, string[]>()
-  records.filter(isActive).forEach((r) => {
+  records.filter(isActive).filter(isCompleteRecord).forEach((r) => {
     const p = processById.get(r.processId)
     if (!p) return
     const wfId = workfaceIdOfItem(p.itemId, wbsById, itemWorkface)
@@ -255,7 +255,7 @@ export function aggregateByWorkface(
         chainages: []
       } satisfies WorkfaceAgg)
     cur.count += 1
-    cur.actualHours += Number.isFinite(r.hours) ? r.hours : 0
+    cur.actualHours += r.hours
     const chain = recordChainage(r)
     if (chain) {
       const values = chainageValues.get(wfId) ?? []
@@ -351,7 +351,9 @@ export function stackedTrend(
   const perPeriod = periods.map((period) => {
     const cell = new Map<string, number>()
     records
-      .filter((r) => isActive(r) && r.date >= period.from && r.date <= period.to)
+      .filter(isActive)
+      .filter(isCompleteRecord)
+      .filter((r) => r.date >= period.from && r.date <= period.to)
       .forEach((r) => {
         const p = processById.get(r.processId)
         if (!p) return
@@ -368,7 +370,7 @@ export function stackedTrend(
             )
           } else groupNames.set(key, p.name)
         }
-        cell.set(key, (cell.get(key) ?? 0) + (Number.isFinite(r.hours) ? r.hours : 0))
+        cell.set(key, (cell.get(key) ?? 0) + r.hours)
       })
     return cell
   })

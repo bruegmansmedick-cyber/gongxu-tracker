@@ -1,15 +1,23 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, shallowRef } from 'vue'
+import { computed, ref } from 'vue'
 import { useRouter } from 'vue-router'
-import { showToast } from 'vant'
+import { showConfirmDialog, showToast } from 'vant'
 import { afterChange, refreshRecords, runSync, setOperator, setProject, state } from '@/store'
-import { applyBenchTemplate, getKv, saveProject, seedHistoryRecords } from '@/db'
+import { applyBenchTemplate, deleteRecordDraft, saveProject, seedHistoryRecords } from '@/db'
 import { BENCH_PROJECT_ID, BENCH_PROJECT_NAME, HISTORY_FACES } from '@/db/seed'
 import { HISTORY_ROWS } from '@/db/history'
-import { computeStats, recordsOfDate } from '@/core/compute'
-import { RECORD_DRAFT_KEY, isRecordDraft, type RecordDraft } from '@/core/recordDraft'
+import {
+  computeStats,
+  isCompleteRecord,
+  isEndPending,
+  recordsOfDate,
+  type CompletedProcessRecord
+} from '@/core/compute'
+import type { RecordDraft } from '@/core/recordDraft'
 import { shortKind, shortSpot } from '@/core/scope'
-import type { Process, ProcessRecord } from '@/types'
+import { buildItemWorkfaceMap } from '@/core/workface'
+import { recordChainage, shortChainageText } from '@/core/chainage'
+import type { Process } from '@/types'
 import { endOfWeek, fmtHoursShort, friendlyDate, startOfWeek, todayStr } from '@/core/time'
 import { reasonLabel } from '@/core/reasons'
 
@@ -24,61 +32,72 @@ const project = computed(() => state.projects.find((p) => p.id === state.current
 const operator = computed(() => state.operators.find((o) => o.id === state.currentOperatorId))
 const processById = computed(() => new Map(state.processes.map((p) => [p.id, p])))
 const wbsById = computed(() => new Map(state.wbs.map((w) => [w.id, w])))
-const recordDraft = shallowRef<RecordDraft | null>(null)
+const workfaceById = computed(() => new Map(state.workfaces.map((w) => [w.id, w])))
+const itemWorkface = computed(() => buildItemWorkfaceMap(state.wbs, state.workfaces))
 
-const todayRecords = computed(() => recordsOfDate(state.records, today))
+const todayRecords = computed(() => recordsOfDate(state.records, today).filter(isCompleteRecord))
+const pendingRecords = computed(() =>
+  state.records.filter(isEndPending).sort((a, b) => b.startAt - a.startAt)
+)
+const drafts = computed(() => state.drafts)
 const todayStats = computed(() => computeStats(state.records, processById.value, today, today))
 const weekStats = computed(() =>
   computeStats(state.records, processById.value, startOfWeek(today), endOfWeek(today))
 )
 
-const draftProcess = computed(() =>
-  recordDraft.value?.processId ? processById.value.get(recordDraft.value.processId) : undefined
-)
-const draftItem = computed(() => {
-  const draft = recordDraft.value
-  if (!draft) return undefined
-  return wbsById.value.get(draftProcess.value?.itemId || draft.itemId)
-})
-const draftDivision = computed(() => {
-  const parentId = draftItem.value?.parentId
-  return parentId ? wbsById.value.get(parentId) : undefined
-})
-const draftUnit = computed(() => {
-  const parentId = draftDivision.value?.parentId
-  return parentId ? wbsById.value.get(parentId) : undefined
-})
-const draftVisible = computed(() => {
-  const draft = recordDraft.value
-  return Boolean(draft && draft.projectId === state.currentProjectId && draft.date === today)
-})
-const draftTitle = computed(() => draftProcess.value?.name || draftItem.value?.name || '未选工序')
-const draftPath = computed(() => {
-  const names = [draftUnit.value?.name, draftDivision.value?.name]
-  if (draftProcess.value || !draftItem.value) names.push(draftItem.value?.name)
-  return names.filter(Boolean).join(' / ')
-})
-const draftTimeText = computed(() => {
-  const draft = recordDraft.value
-  if (!draft) return ''
+interface DraftRow {
+  draft: RecordDraft
+  processName: string
+  path: string
+  timeText: string
+  statusText: string
+}
+
+function draftRowOf(draft: RecordDraft): DraftRow {
+  const process = processById.value.get(draft.processId)
+  const item = wbsById.value.get(process?.itemId || draft.itemId)
+  const division = item?.parentId ? wbsById.value.get(item.parentId) : undefined
+  const face = item
+    ? workfaceById.value.get(itemWorkface.value.get(item.id) ?? item.workfaceId ?? '')?.name
+    : ''
+  const names = [face || division?.name]
+  if (process || !item) names.push(item?.name)
   const start = draft.startInput || draft.startTime || '开工待填'
   const end = draft.endInput.trim() || '完工待填'
-  return `${start} → ${end}`
+  let statusText = '内容待正式保存'
+  if (!item) statusText = '工程结构待选'
+  else if (!process) statusText = '已选分项，工序待补'
+  else if (!draft.endInput.trim()) statusText = '已填开工，待补完工'
+  return {
+    draft,
+    processName: process?.name || item?.name || '未选工序',
+    path: names.filter(Boolean).join(' / '),
+    timeText: `${start} → ${end}`,
+    statusText
+  }
+}
+
+const draftRows = computed(() => drafts.value.map(draftRowOf))
+const draftSyncText = computed(() => {
+  if (!state.sync.configured) return '仅本机保存'
+  return state.sync.pending ? '待同步' : '已同步'
 })
-const draftStatusText = computed(() => {
-  const draft = recordDraft.value
-  if (!draft) return ''
-  if (!draftItem.value) return '工程结构待选'
-  if (!draftProcess.value) return '已选分项，工序待补'
-  if (!draft.endInput.trim()) return '开工已填，待补完工'
-  return '内容待正式保存'
-})
+
+function recordPath(processId: string): string {
+  const process = processById.value.get(processId)
+  const item = process ? wbsById.value.get(process.itemId) : undefined
+  const division = item?.parentId ? wbsById.value.get(item.parentId) : undefined
+  const face = item
+    ? workfaceById.value.get(itemWorkface.value.get(item.id) ?? item.workfaceId ?? '')?.name
+    : ''
+  return [face || division?.name, item?.name].filter(Boolean).join(' / ')
+}
 
 interface Group {
   itemId: string
   itemName: string
   divisionName: string
-  records: ProcessRecord[]
+  records: CompletedProcessRecord[]
   totalHours: number
 }
 
@@ -185,11 +204,11 @@ async function onOperatorSelect(action: { value: string }) {
 }
 
 function addRecord(processId?: string) {
-  if (!state.processes.length && !recordDraft.value) {
+  if (!state.processes.length) {
     showToast('请先在“工程”页建立工序')
     return
   }
-  const query = processId ? { date: today, processId } : { draft: '1' }
+  const query = processId ? { date: today, processId } : {}
   router.push({ path: '/record', query })
 }
 
@@ -197,17 +216,23 @@ function editRecord(id: string) {
   router.push({ path: '/record', query: { id } })
 }
 
-function resumeDraftEntry() {
-  router.push({ path: '/record', query: { draft: '1' } })
+function resumeDraftEntry(draftId: string) {
+  router.push({ path: '/record', query: { draftId } })
 }
 
-async function loadDraft() {
+async function removeDraft(draftId: string) {
   try {
-    const raw = await getKv<unknown>(RECORD_DRAFT_KEY, null)
-    recordDraft.value = isRecordDraft(raw) ? raw : null
+    await showConfirmDialog({
+      title: '删除暂存',
+      message: '这条暂存将从首页移除，并同步到其他设备。正式记录不受影响。',
+      confirmButtonText: '删除'
+    })
   } catch {
-    recordDraft.value = null
+    return
   }
+  await deleteRecordDraft(draftId)
+  await afterChange('drafts')
+  showToast('暂存已删除')
 }
 
 /** 一键建立本标段项目：套用项目划分模板并补录已有循环作业记录 */
@@ -240,7 +265,6 @@ async function createBenchProject() {
 async function onRefresh() {
   refreshing.value = true
   try {
-    await loadDraft()
     if (state.sync.configured) await runSync(true)
     else {
       await refreshRecords()
@@ -250,10 +274,6 @@ async function onRefresh() {
     refreshing.value = false
   }
 }
-
-onMounted(() => {
-  void loadDraft()
-})
 </script>
 
 <template>
@@ -298,6 +318,9 @@ onMounted(() => {
         <div v-if="todayStats.gapHours > 0" class="muted" style="margin-top: 8px">
           今日衔接空隙合计 {{ fmtHoursShort(todayStats.gapHours) }}
         </div>
+        <div v-if="pendingRecords.length" class="muted" style="margin-top: 8px; color: #9a6200">
+          另有 {{ pendingRecords.length }} 条未完工，已单独列出，完工前不计工时
+        </div>
       </div>
 
       <template v-if="!state.projects.length">
@@ -320,25 +343,75 @@ onMounted(() => {
       </template>
 
       <template v-else>
+        <div v-if="draftRows.length" class="card">
+          <div class="card-title">
+            暂存记录
+            <span class="sub">{{ draftRows.length }} 条 · {{ draftSyncText }}</span>
+          </div>
+          <div class="draft-list">
+            <div v-for="row in draftRows" :key="row.draft.id" class="draft-row">
+              <button type="button" class="draft-main" @click="resumeDraftEntry(row.draft.id)">
+                <div class="record-main">
+                  <div class="record-name">
+                    <van-tag class="draft-tag" color="#fff1cc" text-color="#9a6200">暂存</van-tag>
+                    {{ row.processName }}
+                  </div>
+                  <div class="muted">{{ row.draft.date }} · {{ row.timeText }}</div>
+                  <div v-if="row.path" class="muted">{{ row.path }}</div>
+                  <div class="draft-status">{{ row.statusText }}</div>
+                </div>
+                <span class="draft-continue">继续填写 <van-icon name="arrow" /></span>
+              </button>
+              <button
+                type="button"
+                class="draft-delete"
+                :aria-label="`删除暂存 ${row.processName}`"
+                @click="removeDraft(row.draft.id)"
+              >
+                <van-icon name="delete-o" />
+              </button>
+            </div>
+          </div>
+        </div>
+
         <div class="card">
           <div class="card-title">
             今日工序记录
-            <span class="sub">{{ today }}<template v-if="draftVisible"> · 1 条暂存</template></span>
+            <span class="sub">{{ today }}</span>
           </div>
 
-          <div v-if="draftVisible" class="draft-row" @click="resumeDraftEntry">
-            <div class="record-main">
-              <div class="record-name">
-                <van-tag class="draft-tag" color="#fff1cc" text-color="#9a6200">暂存</van-tag>
-                {{ draftTitle }}
-              </div>
-              <div v-if="draftPath" class="muted">{{ draftPath }}</div>
-              <div class="muted">{{ draftTimeText }} · {{ draftStatusText }}</div>
+          <div v-if="pendingRecords.length" class="pending-block">
+            <div class="pending-head">
+              <span>未完工 · 待补结束时间</span>
+              <span class="muted">含跨日 {{ pendingRecords.length }} 条</span>
             </div>
-            <div class="draft-continue">继续填写 <van-icon name="arrow" /></div>
+            <button
+              v-for="r in pendingRecords"
+              :key="r.id"
+              type="button"
+              class="record-row pending-row pending-row-button"
+              :aria-label="`补填 ${r.date} ${processById.get(r.processId)?.name ?? '工序'} 的完工时间`"
+              @click="editRecord(r.id)"
+            >
+              <div class="record-main">
+                <div class="record-name">
+                  <van-tag class="pending-tag" color="#fff0e6" text-color="#a34c00">待补完工</van-tag>
+                  {{ processById.get(r.processId)?.name ?? '未知工序' }}
+                </div>
+                <div class="muted">
+                  {{ r.date }} · {{ r.startTime }} → 待补
+                  <template v-if="shortChainageText(recordChainage(r))">
+                    · 桩号 {{ shortChainageText(recordChainage(r)) }}
+                  </template>
+                  <template v-if="r.location"> · {{ r.location }}</template>
+                </div>
+                <div class="muted">{{ recordPath(r.processId) }}</div>
+              </div>
+              <div class="pending-hours">未完工</div>
+            </button>
           </div>
 
-          <van-empty v-if="!groups.length && !draftVisible" description="今天还没有记录" image-size="72" />
+          <van-empty v-if="!groups.length && !pendingRecords.length" description="今天还没有记录" image-size="72" />
 
           <div v-for="g in groups" :key="g.itemId" class="group">
             <div class="group-head">
@@ -450,18 +523,52 @@ onMounted(() => {
 
 .draft-row {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
+  align-items: stretch;
+  gap: 4px;
   margin: 4px 0 10px;
-  padding: 12px;
+  padding: 6px;
   border: 1px solid #f3d590;
   border-radius: 10px;
   background: #fffaf0;
 }
 
-.draft-row:active {
+.draft-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 6px;
+  border: 0;
+  background: transparent;
+  text-align: left;
+  color: inherit;
+}
+
+.draft-main:active {
   background: #fff4d8;
+  border-radius: 8px;
+}
+
+.draft-delete {
+  flex: 0 0 44px;
+  min-height: 44px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #a36a00;
+}
+
+.draft-delete:active {
+  background: #fff0c7;
+}
+
+.draft-status {
+  margin-top: 4px;
+  color: #9a6200;
+  font-size: 12px;
+  font-weight: 600;
 }
 
 .draft-tag {
@@ -473,6 +580,50 @@ onMounted(() => {
   align-items: center;
   gap: 2px;
   color: #9a6200;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.pending-block {
+  margin: 4px 0 12px;
+  padding: 10px;
+  border: 1px solid #f2c9a8;
+  border-radius: 10px;
+  background: #fff9f4;
+}
+
+.pending-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 2px 2px 8px;
+  color: #8f4300;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.pending-row {
+  padding-left: 2px;
+  padding-right: 2px;
+}
+
+.pending-row-button {
+  width: 100%;
+  border-right: 0;
+  border-bottom: 0;
+  border-left: 0;
+  background: transparent;
+  color: inherit;
+  text-align: left;
+}
+
+.pending-tag {
+  margin-right: 6px;
+}
+
+.pending-hours {
+  color: #a34c00;
   font-size: 13px;
   font-weight: 600;
   white-space: nowrap;

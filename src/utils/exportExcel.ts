@@ -5,6 +5,7 @@ import {
   computeGapRows,
   computeStats,
   completionByItem,
+  isCompleteRecord,
   monthPeriods,
   weekPeriods
 } from '@/core/compute'
@@ -52,6 +53,7 @@ export function exportProjectExcel(opts: ExportOptions): void {
     '开工时刻',
     '完工时刻',
     '净用时(h)',
+    '状态',
     '工程量',
     '单位',
     '桩号',
@@ -77,8 +79,9 @@ export function exportProjectExcel(opts: ExportOptions): void {
         path.item,
         p?.name ?? '',
         r.startTime,
-        r.endTime,
-        Number(r.hours.toFixed(2)),
+        r.endTime ?? '',
+        isCompleteRecord(r) ? Number(r.hours.toFixed(2)) : null,
+        isCompleteRecord(r) ? '已完成' : '待补完工',
         r.quantity ?? null,
         p?.unit ?? '',
         shortChainageText(recordChainage(r)),
@@ -180,12 +183,23 @@ export function exportProjectExcel(opts: ExportOptions): void {
   ] as CellValue[])
 
   const summary = computeStats(opts.records, processById, opts.from, opts.to)
-  const overviewHeader: CellValue[] = ['项目', '统计区间', '记录条数', '实际工时(h)', '标准工时(h)', '总量口径效率', '工序平均偏差', '衔接空隙(h)']
+  const overviewHeader: CellValue[] = [
+    '项目',
+    '统计区间',
+    '有效记录条数',
+    '待补完工',
+    '实际工时(h)',
+    '标准工时(h)',
+    '总量口径效率',
+    '工序平均偏差',
+    '衔接空隙(h)'
+  ]
   const overviewRows: CellValue[][] = [
     [
       opts.projectName,
       `${opts.from} ~ ${opts.to}`,
       summary.recordCount,
+      summary.pendingCount,
       Number(summary.actualHours.toFixed(2)),
       Number(summary.standardHours.toFixed(2)),
       summary.totalEfficiency === null ? null : Number(summary.totalEfficiency.toFixed(4)),

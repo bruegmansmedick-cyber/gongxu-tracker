@@ -1,5 +1,6 @@
 import type {
   CatalogPayload,
+  DraftsPayload,
   Operator,
   Process,
   ProcessRecord,
@@ -9,8 +10,17 @@ import type {
   WbsNode,
   Workface
 } from '@/types'
-import { buildTimeFields } from '@/core/compute'
+import { buildStartAt, buildTimeFields, ensureTimes } from '@/core/compute'
 import { uid } from '@/core/id'
+import {
+  isLegacyRecordDraft,
+  makeRecordDraft,
+  migrateLegacyRecordDraft,
+  RECORD_DRAFT_KEY,
+  type RecordDraft,
+  type RecordDraftInput
+} from '@/core/recordDraft'
+import { mergeSyncable } from '@/sync/merge'
 import { canMergeWorkfaces, planWorkfaceInit, workfaceIdOf, workfacesOfCatalog } from '@/core/workface'
 import { monthKey, todayStr } from '@/core/time'
 import { BENCH_TEMPLATE, faceOfItem, refHoursOf } from '@/db/seed'
@@ -110,7 +120,10 @@ export async function setProjectArchived(id: string, archived: 0 | 1): Promise<v
 export async function deleteProject(id: string): Promise<void> {
   const now = Date.now()
   const months = new Set<string>()
-  await db.transaction('rw', db.projects, db.wbs, db.processes, db.records, db.workfaces, async () => {
+  await db.transaction(
+    'rw',
+    [db.projects, db.wbs, db.processes, db.records, db.workfaces, db.recordDrafts],
+    async () => {
     const project = await db.projects.get(id)
     if (project) await db.projects.put({ ...project, deletedAt: now, updatedAt: now })
     for (const row of await db.wbs.where('projectId').equals(id).toArray()) {
@@ -122,11 +135,15 @@ export async function deleteProject(id: string): Promise<void> {
     for (const row of await db.workfaces.where('projectId').equals(id).toArray()) {
       await db.workfaces.put({ ...row, deletedAt: now, updatedAt: now })
     }
+    for (const row of await db.recordDrafts.where('projectId').equals(id).toArray()) {
+      if (!row.deletedAt) await db.recordDrafts.put({ ...row, deletedAt: now, updatedAt: now, savedAt: now })
+    }
     for (const row of await db.records.where('projectId').equals(id).toArray()) {
       if (!row.deletedAt) months.add(monthKey(row.date))
       await db.records.put({ ...row, deletedAt: now, updatedAt: now })
     }
-  })
+    }
+  )
   for (const m of months) await markDirtyMonth(m)
   await markPending()
   await logAudit({
@@ -681,7 +698,7 @@ export async function listRecords(projectId: string): Promise<ProcessRecord[]> {
   const rows = await db.records.where('projectId').equals(projectId).toArray()
   return rows
     .filter((r) => !r.deletedAt)
-    .map((r) => (r.startAt && r.endAt && Number.isFinite(r.hours) ? r : { ...r, ...buildTimeFields(r.date, r.startTime, r.endTime) }))
+    .map(ensureTimes)
     .sort((a, b) => b.startAt - a.startAt)
 }
 
@@ -691,7 +708,7 @@ export interface RecordInput {
   processId: string
   date: string
   startTime: string
-  endTime: string
+  endTime?: string
   quantity?: number
   gapReason?: string
   gapStartTime?: string
@@ -707,7 +724,9 @@ export interface RecordInput {
 export async function saveRecord(input: RecordInput): Promise<ProcessRecord> {
   const now = Date.now()
   const existing = input.id ? await db.records.get(input.id) : undefined
-  const times = buildTimeFields(input.date, input.startTime, input.endTime)
+  const endTime = input.endTime?.trim() ?? ''
+  const endPending = !endTime
+  const times = endPending ? null : buildTimeFields(input.date, input.startTime, endTime)
   const device = await getKv<string>('device.id', '')
   const row: ProcessRecord = {
     id: existing?.id ?? input.id ?? uid('rec-'),
@@ -715,8 +734,11 @@ export async function saveRecord(input: RecordInput): Promise<ProcessRecord> {
     processId: input.processId,
     date: input.date,
     startTime: input.startTime,
-    endTime: input.endTime,
-    ...times,
+    startAt: buildStartAt(input.date, input.startTime),
+    endTime: times ? endTime : undefined,
+    endAt: times?.endAt,
+    hours: times?.hours,
+    endPending: endPending ? 1 : undefined,
     quantity: input.quantity,
     gapReason: input.gapReason,
     gapStartTime: input.gapStartTime,
@@ -745,7 +767,7 @@ export async function saveRecord(input: RecordInput): Promise<ProcessRecord> {
     entity: 'record',
     entityId: row.id,
     date: row.date,
-    summary: `${process?.name ?? '未知工序'}｜${row.date} ${row.startTime}-${row.endTime}`,
+    summary: `${process?.name ?? '未知工序'}｜${row.date} ${row.startTime}-${row.endTime ?? '未完工'}`,
     changes: existing
       ? diffOf(
           existing as unknown as Record<string, unknown>,
@@ -754,6 +776,7 @@ export async function saveRecord(input: RecordInput): Promise<ProcessRecord> {
             'date',
             'startTime',
             'endTime',
+            'endPending',
             'quantity',
             'gapReason',
             'gapStartTime',
@@ -783,7 +806,7 @@ export async function deleteRecord(id: string): Promise<void> {
     entity: 'record',
     entityId: id,
     date: row.date,
-    summary: `删除记录：${process?.name ?? '未知工序'}｜${row.date} ${row.startTime}-${row.endTime}`
+    summary: `删除记录：${process?.name ?? '未知工序'}｜${row.date} ${row.startTime}-${row.endTime ?? '未完工'}`
   })
 }
 
@@ -794,6 +817,54 @@ export async function getRecord(id: string): Promise<ProcessRecord | undefined> 
 /** 记录列表（用于导出、图表）：含跨项目 */
 export async function allRecords(): Promise<ProcessRecord[]> {
   return db.records.toArray()
+}
+
+// --------------------------------------------------------------- 多条工序草稿
+
+export async function listRecordDrafts(projectId: string): Promise<RecordDraft[]> {
+  const rows = await db.recordDrafts.where('projectId').equals(projectId).toArray()
+  return rows.filter((r) => !r.deletedAt).sort((a, b) => b.updatedAt - a.updatedAt)
+}
+
+export async function getRecordDraft(id: string): Promise<RecordDraft | undefined> {
+  const row = await db.recordDrafts.get(id)
+  return row && !row.deletedAt ? row : undefined
+}
+
+export async function saveRecordDraft(
+  input: RecordDraftInput & { id?: string }
+): Promise<RecordDraft> {
+  const now = Date.now()
+  const existing = input.id ? await db.recordDrafts.get(input.id) : undefined
+  const row = makeRecordDraft(input, now, {
+    id: existing?.id ?? input.id ?? uid('draft-'),
+    createdAt: existing?.createdAt ?? now
+  })
+  await db.recordDrafts.put(row)
+  await markPending()
+  return row
+}
+
+export async function deleteRecordDraft(id: string): Promise<void> {
+  const row = await db.recordDrafts.get(id)
+  if (!row || row.deletedAt) return
+  const now = Date.now()
+  await db.recordDrafts.put({ ...row, savedAt: now, updatedAt: now, deletedAt: now })
+  await markPending()
+}
+
+/** 把旧版单草稿键迁移到多草稿表；成功写入新表后才删除旧键。 */
+export async function ensureLegacyRecordDraftMigrated(): Promise<RecordDraft | null> {
+  const raw = await getKv<unknown>(RECORD_DRAFT_KEY, null)
+  if (!isLegacyRecordDraft(raw)) return null
+  const migrated = migrateLegacyRecordDraft(raw)
+  const existing = await db.recordDrafts.get(migrated.id)
+  if (!existing) {
+    await db.recordDrafts.put(migrated)
+    await markPending()
+  }
+  await delKv(RECORD_DRAFT_KEY)
+  return existing && !existing.deletedAt ? existing : migrated
 }
 
 // ----------------------------------------------------------- 同步所需数据包
@@ -850,26 +921,42 @@ export async function writeRecordsPayload(payload: RecordsPayload): Promise<void
   await db.records.bulkPut(payload.records)
 }
 
+export async function readDraftsPayload(): Promise<DraftsPayload> {
+  const drafts = await db.recordDrafts.toArray()
+  return {
+    schemaVersion: 1,
+    updatedAt: Math.max(0, ...drafts.map((r) => r.updatedAt)),
+    drafts
+  }
+}
+
+export async function writeDraftsPayload(payload: DraftsPayload): Promise<void> {
+  if (payload.drafts?.length) await db.recordDrafts.bulkPut(payload.drafts)
+}
+
 // ------------------------------------------------------------------ 备份
 
 export interface BackupFile {
   meta: { schemaVersion: number; exportedAt: string; app: string }
   catalog: CatalogPayload
   records: ProcessRecord[]
+  drafts?: RecordDraft[]
   settings?: Record<string, unknown>
 }
 
 export async function exportBackup(): Promise<BackupFile> {
   const catalog = await readCatalogPayload()
   const records = await db.records.toArray()
+  const drafts = await db.recordDrafts.toArray()
   const syncSettings = {
     pat: await getKv<string>('sync.pat', ''),
     gistId: await getKv<string>('sync.gistId', '')
   }
   return {
-    meta: { schemaVersion: 1, exportedAt: new Date().toISOString(), app: 'gongxu-tracker' },
+    meta: { schemaVersion: 2, exportedAt: new Date().toISOString(), app: 'gongxu-tracker' },
     catalog,
     records,
+    drafts,
     settings: syncSettings
   }
 }
@@ -879,6 +966,10 @@ export async function importBackup(file: BackupFile, includeSettings = false): P
   await setKv('backup.beforeImport', snapshot)
   await writeCatalogPayload(file.catalog)
   if (file.records?.length) await db.records.bulkPut(file.records)
+  if (file.drafts?.length) {
+    const local = await db.recordDrafts.toArray()
+    await db.recordDrafts.bulkPut(mergeSyncable(local, file.drafts).rows)
+  }
   if (includeSettings && file.settings) {
     if (typeof file.settings.pat === 'string') await setKv('sync.pat', file.settings.pat)
     if (typeof file.settings.gistId === 'string') await setKv('sync.gistId', file.settings.gistId)
@@ -892,7 +983,7 @@ export async function importBackup(file: BackupFile, includeSettings = false): P
     action: 'import',
     entity: 'system',
     entityId: 'backup',
-    summary: `导入备份：项目 ${file.catalog?.projects?.length ?? 0} 个、工序 ${file.catalog?.processes?.length ?? 0} 条、记录 ${file.records?.length ?? 0} 条`,
+    summary: `导入备份：项目 ${file.catalog?.projects?.length ?? 0} 个、工序 ${file.catalog?.processes?.length ?? 0} 条、记录 ${file.records?.length ?? 0} 条、暂存 ${file.drafts?.length ?? 0} 条`,
     changes: undefined
   })
 }
@@ -906,6 +997,7 @@ export async function restoreImportSnapshot(): Promise<boolean> {
   if (!snap) return false
   await writeCatalogPayload(snap.catalog)
   if (snap.records?.length) await db.records.bulkPut(snap.records)
+  if (snap.drafts?.length) await db.recordDrafts.bulkPut(snap.drafts)
   await markPending()
   await logAudit({
     action: 'restore',
@@ -919,7 +1011,7 @@ export async function restoreImportSnapshot(): Promise<boolean> {
 export async function wipeLocalData(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.projects, db.wbs, db.processes, db.records, db.operators, db.workfaces],
+    [db.projects, db.wbs, db.processes, db.records, db.operators, db.workfaces, db.recordDrafts],
     async () => {
       await Promise.all([
         db.projects.clear(),
@@ -927,7 +1019,8 @@ export async function wipeLocalData(): Promise<void> {
         db.processes.clear(),
         db.records.clear(),
         db.operators.clear(),
-        db.workfaces.clear()
+        db.workfaces.clear(),
+        db.recordDrafts.clear()
       ])
     }
   )

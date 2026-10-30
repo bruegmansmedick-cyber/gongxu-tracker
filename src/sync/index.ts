@@ -2,7 +2,7 @@
  * 同步引擎：拉取云端 → 与本地按 id + updatedAt 逐条合并 → 只推变化的部分 → 回拉校验。
  * 存储后端可切换（Gitee 私有仓库 / GitHub Gist），合并逻辑与数据格式完全一致。
  */
-import type { CatalogPayload, MetaPayload, RecordsPayload } from '@/types'
+import type { CatalogPayload, DraftsPayload, MetaPayload, RecordsPayload } from '@/types'
 import {
   clearDirtyMonths,
   clearPending,
@@ -11,11 +11,14 @@ import {
   getKv,
   isPending,
   readCatalogPayload,
+  readDraftsPayload,
   readRecordsPayload,
   setKv,
   writeCatalogPayload,
+  writeDraftsPayload,
   writeRecordsPayload
 } from '@/db'
+import { isRecordDraft } from '@/core/recordDraft'
 import { monthKey } from '@/core/time'
 import { mergeSyncable, normalizeForCompare } from '@/sync/merge'
 import { workfacesOfCatalog } from '@/core/workface'
@@ -46,6 +49,7 @@ export interface SyncResult {
   message: string
   pushedFiles: number
   pulledRecords: number
+  pulledDrafts?: number
   lastSyncAt: number
   conflict?: boolean
   /** 本次改动过大，需要管理口令确认后才上传 */
@@ -107,9 +111,11 @@ export async function createDataSpace(
 ): Promise<{ gistId?: string; repo?: string; reused?: boolean }> {
   const meta: MetaPayload = { schemaVersion: 1, updatedAt: Date.now(), deviceId }
   const catalog = await readCatalogPayload()
+  const drafts = await readDraftsPayload()
   const files = {
     'meta.json': JSON.stringify(meta, null, 2),
-    'catalog.json': JSON.stringify(catalog, null, 2)
+    'catalog.json': JSON.stringify(catalog, null, 2),
+    ...(drafts.drafts.length ? { 'drafts.json': JSON.stringify(drafts, null, 2) } : {})
   }
   if (cfg.backend === 'gitee') {
     const repo = await createGiteeRepo(
@@ -191,6 +197,7 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
 
   let pushedFiles = 0
   let pulledRecords = 0
+  let pulledDrafts = 0
   let conflict = false
   const allowBulkOnce = await getKv<boolean>(ALLOW_BULK_ONCE_KEY, false)
 
@@ -204,7 +211,53 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
 
       const filesToPush: Record<string, string> = {}
 
-      // 1) 目录数据：项目 / 工程结构 / 工序 / 操作人
+      // 1) 暂存草稿：单文件、按 id + updatedAt 合并；旧云端没有时完全兼容
+      const localDrafts = await readDraftsPayload()
+      const remoteDraftsRaw = remoteFiles['drafts.json']
+      const remoteDraftsPayload = parseJson<DraftsPayload>(remoteDraftsRaw)
+      if (remoteDraftsRaw && !remoteDraftsPayload) {
+        throw new Error('云端 drafts.json 格式损坏，已停止同步以保护本机暂存；请联系维护者恢复该文件')
+      }
+      const remoteDrafts = remoteDraftsPayload?.drafts ?? []
+      if (!Array.isArray(remoteDrafts) || !remoteDrafts.every(isRecordDraft)) {
+        throw new Error('云端 drafts.json 含有无效暂存记录，已停止同步以保护本机数据')
+      }
+      const draftMerge = mergeSyncable(localDrafts.drafts, remoteDrafts)
+      const localDraftIds = new Set(localDrafts.drafts.map((r) => r.id))
+      pulledDrafts += remoteDrafts.filter((r) => !localDraftIds.has(r.id) && !r.deletedAt).length
+      if (draftMerge.localDiffers) {
+        await writeDraftsPayload({
+          schemaVersion: 1,
+          updatedAt: Math.max(localDrafts.updatedAt, remoteDraftsPayload?.updatedAt ?? 0),
+          drafts: draftMerge.rows
+        })
+      }
+      let changedDrafts = 0
+      let deletedDrafts = 0
+      if (draftMerge.remoteDiffers) {
+        const remoteById = new Map(remoteDrafts.map((r) => [r.id, r]))
+        draftMerge.rows.forEach((row) => {
+          const remote = remoteById.get(row.id)
+          if (!remote) {
+            if (!row.deletedAt) changedDrafts += 1
+            return
+          }
+          if (JSON.stringify(row) === JSON.stringify(remote)) return
+          if (row.deletedAt && !remote.deletedAt) deletedDrafts += 1
+          else changedDrafts += 1
+        })
+        const payload: DraftsPayload = {
+          schemaVersion: 1,
+          updatedAt: Math.max(Date.now(), remoteDraftsPayload?.updatedAt ?? 0),
+          drafts: normalizeForCompare(draftMerge.rows)
+        }
+        if (payloadSize(payload) > MAX_FILE_BYTES) {
+          throw new Error('暂存数据超过 900KB，请先清理已处理或不再需要的暂存记录')
+        }
+        filesToPush['drafts.json'] = JSON.stringify(payload)
+      }
+
+      // 2) 目录数据：项目 / 工程结构 / 工序 / 操作人
       const localCatalog = await readCatalogPayload()
       const pMerge = mergeSyncable(localCatalog.projects ?? [], remoteCatalog?.projects ?? [])
       const wMerge = mergeSyncable(localCatalog.wbs ?? [], remoteCatalog?.wbs ?? [])
@@ -241,7 +294,7 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
         filesToPush['catalog.json'] = JSON.stringify(mergedCatalog)
       }
 
-      // 2) 按月分片的记录
+      // 3) 按月分片的记录
       const dirty = await getDirtyMonths()
       const months = Array.from(new Set([...(await localMonths()), ...remoteMonths, ...dirty])).sort()
       let changedRecords = 0
@@ -285,7 +338,7 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
         }
       }
 
-      // 3) 操作留痕：只追加、按 id 求并集，任何设备都无法用 App 抹掉历史
+      // 4) 操作留痕：只追加、按 id 求并集，任何设备都无法用 App 抹掉历史
       const auditMonths = Array.from(
         new Set([
           ...(await localAuditMonths()),
@@ -316,10 +369,12 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
         }
       }
 
-      // 4) 推送
-      const bulkLike = changedRecords + deletedRecords > BULK_CHANGE_LIMIT || deletedRecords > BULK_DELETE_LIMIT
+      // 5) 推送
+      const changedTotal = changedRecords + changedDrafts
+      const deletedTotal = deletedRecords + deletedDrafts
+      const bulkLike = changedTotal > BULK_CHANGE_LIMIT || deletedTotal > BULK_DELETE_LIMIT
       if (bulkLike && !opts.confirmBulk && !allowBulkOnce) {
-        const summary = `本次同步包含 修改 ${changedRecords} 条、删除 ${deletedRecords} 条，已暂缓上传，等待管理口令确认`
+        const summary = `本次同步包含 修改 ${changedTotal} 条、删除 ${deletedTotal} 条，已暂缓上传，等待管理口令确认`
         // 同一批改动每次自动同步都会再试一次，避免把告警页刷屏：10 分钟内同内容只记一条
         const recent = await listAudit({ limit: 10 })
         const lastBlocked = recent.find((a) => a.action === 'bulk-blocked')
@@ -330,19 +385,19 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
             entityId: 'sync',
             summary,
             changes: [
-              { field: '修改', from: '—', to: String(changedRecords) },
-              { field: '删除', from: '—', to: String(deletedRecords) }
+              { field: '修改', from: '—', to: String(changedTotal) },
+              { field: '删除', from: '—', to: String(deletedTotal) }
             ]
           })
         }
         return {
           ok: false,
-          message: `本次改动较大（修改 ${changedRecords} 条、删除 ${deletedRecords} 条），已暂缓上传。请输入管理口令确认后再同步。`,
+          message: `本次改动较大（修改 ${changedTotal} 条、删除 ${deletedTotal} 条），已暂缓上传。请输入管理口令确认后再同步。`,
           pushedFiles: 0,
           pulledRecords: Math.max(0, pulledRecords),
           lastSyncAt: 0,
           needsConfirm: true,
-          bulk: { changed: changedRecords, deleted: deletedRecords }
+          bulk: { changed: changedTotal, deleted: deletedTotal }
         }
       }
       if (bulkLike && (opts.confirmBulk || allowBulkOnce)) {
@@ -350,10 +405,10 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
           action: 'bulk-approved',
           entity: 'system',
           entityId: 'sync',
-          summary: `${opts.confirmBulk ? '管理口令确认' : '首次补录/导入白名单'}后上传：修改 ${changedRecords} 条、删除 ${deletedRecords} 条`,
+          summary: `${opts.confirmBulk ? '管理口令确认' : '首次补录/导入白名单'}后上传：修改 ${changedTotal} 条、删除 ${deletedTotal} 条`,
           changes: [
-            { field: '修改', from: '—', to: String(changedRecords) },
-            { field: '删除', from: '—', to: String(deletedRecords) }
+            { field: '修改', from: '—', to: String(changedTotal) },
+            { field: '删除', from: '—', to: String(deletedTotal) }
           ]
         })
       }
@@ -363,7 +418,7 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
         if (allowBulkOnce) await setKv(ALLOW_BULK_ONCE_KEY, false)
       }
 
-      // 5) 回拉校验：确认推上去的内容没有被别的设备覆盖
+      // 6) 回拉校验：确认推上去的内容没有被别的设备覆盖
       const verify = await store.readAll()
       const overwritten = Object.entries(filesToPush).some(([name, content]) => verify[name] !== content)
       if (!overwritten) {
@@ -375,6 +430,7 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
           message: pushedFiles ? `同步完成（${store.label}），已上传 ${pushedFiles} 个数据文件` : '同步完成，已是最新数据',
           pushedFiles,
           pulledRecords: Math.max(0, pulledRecords),
+          pulledDrafts,
           lastSyncAt: Date.now()
         }
       }
@@ -388,12 +444,21 @@ export async function syncNow(opts: { confirmBulk?: boolean } = {}): Promise<Syn
       message: '同步完成（检测到另一台设备同时在写入，已自动再合并一次）',
       pushedFiles,
       pulledRecords: Math.max(0, pulledRecords),
+      pulledDrafts,
       lastSyncAt: Date.now(),
       conflict
     }
   } catch (err) {
     const message = err instanceof Error ? err.message : '同步失败，请检查网络'
-    return { ok: false, message, pushedFiles, pulledRecords: Math.max(0, pulledRecords), lastSyncAt: 0, conflict }
+    return {
+      ok: false,
+      message,
+      pushedFiles,
+      pulledRecords: Math.max(0, pulledRecords),
+      pulledDrafts,
+      lastSyncAt: 0,
+      conflict
+    }
   }
 }
 

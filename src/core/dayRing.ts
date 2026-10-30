@@ -7,7 +7,7 @@
  *
  * 纯函数，不碰 DOM：几何与配色都在这里算，组件只负责画。
  */
-import { isActive } from '@/core/compute'
+import { isActive, isCompleteRecord, type CompletedProcessRecord } from '@/core/compute'
 import { shortItemLabel, shortSpot, workfaceIdOfItem } from '@/core/scope'
 import { recordChainage, shortChainageText } from '@/core/chainage'
 import { workfaceLabel } from '@/core/workface'
@@ -133,7 +133,10 @@ export function coveredMinutes(spans: Array<[number, number]>): number {
 }
 
 export function buildDayRing(input: DayRingInput): DayRingData {
-  const rows = input.records.filter((r) => isActive(r) && r.date === input.date)
+  const rows: CompletedProcessRecord[] = input.records
+    .filter(isActive)
+    .filter(isCompleteRecord)
+    .filter((r) => r.date === input.date)
 
   const segments: RingSegment[] = []
   rows.forEach((r) => {
@@ -160,7 +163,7 @@ export function buildDayRing(input: DayRingInput): DayRingData {
       color: RING_PALETTE[0],
       startMin,
       endMin,
-      hours: Number.isFinite(r.hours) ? r.hours : 0,
+      hours: r.hours,
       lane: 0,
       overflow: false,
       crossMidnight,
